@@ -34,11 +34,13 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, copy, nullable) NSString *title, *artist;
 @property (nonatomic, assign) BOOL playing;
 // 进度快照:MediaRemote 的 (elapsed, timestamp, rate)。网易云只在事件
-// (切歌/拖动进度/暂停)时重发布快照,平时冻结;真实进度无状态计算:
-//   position = elapsed + (now - timestamp) × rate
-// 每次重发布(含拖动)都精确归位,不再需要锚点启发式。
+// (切歌/拖动进度/暂停)时重发布快照,平时冻结;推进公式(同 LyricsX
+// MediaRemoteAdapter):position = elapsed + (now - timestamp) × rate。
+// 暂停判定不用字典 rate(滞后),用实时的 IsPlaying:为假则冻结在 lastPos。
 @property (nonatomic, assign) double snapElapsed, snapTS, snapRate;
 @property (nonatomic, assign) BOOL hasSnapshot;
+@property (nonatomic, assign) double lastPos;
+@property (nonatomic, assign) BOOL snapDirty;
 // 歌词
 @property (nonatomic, copy, nullable) NSArray<TBLyricLine *> *lines;
 @property (nonatomic, assign) NSInteger currentLine;
@@ -154,23 +156,36 @@ static void postMediaKey(int key) {
     // 记录最新快照。切歌过渡期可能短暂出现新歌名 + 旧进度(网易云分两步
     // 更新字典),下一次重发布即自行修正,无需特判。
     if (elapsed) {
-        self.snapElapsed = elapsed.doubleValue;
-        self.snapRate    = rateNum ? rateNum.doubleValue : 1.0;
-        self.snapTS      = tsDate ? tsDate.timeIntervalSince1970
-                                  : [NSDate date].timeIntervalSince1970;
-        self.hasSnapshot = YES;
+        double e  = elapsed.doubleValue;
+        double ts = tsDate ? tsDate.timeIntervalSince1970
+                           : [NSDate date].timeIntervalSince1970;
+        if (!self.hasSnapshot || e != self.snapElapsed || ts != self.snapTS) {
+            self.snapElapsed = e;
+            self.snapRate    = rateNum ? rateNum.doubleValue : 1.0;
+            self.snapTS      = ts;
+            self.hasSnapshot = YES;
+            self.snapDirty   = YES;   // 快照重发布(含拖动进度),允许重新计算
+        }
     }
+    BOOL wasPlaying = self.playing;
     if (playingNum) self.playing = playingNum.boolValue;
+    if (self.playing && !wasPlaying) self.snapDirty = YES;   // 恢复播放立即续走
 
     if (songChanged) [self fetchLyrics];
     [self refreshLine];
 }
 
-/// 无状态计算当前播放进度(见 snapElapsed 属性注释)
+/// 当前播放进度:播放中按公式推进;暂停时冻结在 lastPos(LyricsX 同款语义)。
+/// 暂停期间拖动进度 → 快照重发布(snapDirty)→ 直接落位到新 elapsed。
 - (double)displayElapsed {
     if (!self.hasSnapshot) return 0;
-    double rate = self.snapRate > 0 ? self.snapRate : 1.0;
-    return self.snapElapsed + ([[NSDate date] timeIntervalSince1970] - self.snapTS) * rate;
+    if (self.playing || self.snapDirty) {
+        double rate = self.snapRate > 0 ? self.snapRate : 1.0;
+        self.lastPos = self.snapElapsed
+            + ([[NSDate date] timeIntervalSince1970] - self.snapTS) * rate;
+        self.snapDirty = NO;
+    }
+    return self.lastPos;
 }
 
 - (void)fetchLyrics {
