@@ -3,7 +3,8 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-APP="TouchBarLyrics.app"
+# 产出固定安装到用户主目录,避免和工作区缓存目录耦合
+APP="/Users/lumingyuan/TouchBarLyrics.app"
 OUT="$APP/Contents/MacOS"
 PLIST="$APP/Contents/Info.plist"
 
