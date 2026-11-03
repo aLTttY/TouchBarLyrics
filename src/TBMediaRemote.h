@@ -13,6 +13,9 @@ typedef void (^TBNowPlayingHandler)(NSDictionary *_Nullable info);
 - (void)startWithHandler:(TBNowPlayingHandler)handler;
 /// 立即拉取一次
 - (void)pollNow;
+/// 向"正在播放"app 发控制命令(kMRPlay=0 kMRPause=1 kMRTogglePlayPause=2
+/// kMRNextTrack=4 kMRPreviousTrack=5)。返回 NO 表示本机不支持该入口。
++ (BOOL)sendCommand:(int)command;
 @end
 
 NS_ASSUME_NONNULL_END

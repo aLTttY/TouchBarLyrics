@@ -23,6 +23,8 @@ static NSString *kTitle, *kArtist, *kAlbum, *kElapsed, *kDuration, *kRate, *kTim
 static MRGetNowPlayingInfoFn mrGetInfo;
 static MRRegisterNotificationsFn mrRegister;
 static MRGetPlayingFn mrGetPlaying;
+// Sonoma 签名:bool MRMediaRemoteSendCommand(int command, id userInfo)
+static BOOL (*mrSendCommand)(int, id) = NULL;
 
 @implementation TBMediaRemote
 
@@ -113,6 +115,16 @@ static MRGetPlayingFn mrGetPlaying;
     dispatch_async(dispatch_get_main_queue(), ^{
         if (self.handler) self.handler(out.count ? out : nil);
     });
+}
+
++ (BOOL)sendCommand:(int)command {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        void *h = dlopen("/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote", RTLD_LAZY);
+        if (h) mrSendCommand = (BOOL (*)(int, id))dlsym(h, "MRMediaRemoteSendCommand");
+    });
+    if (!mrSendCommand) return NO;
+    return mrSendCommand(command, nil) ? YES : NO;
 }
 
 @end

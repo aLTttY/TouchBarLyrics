@@ -6,7 +6,10 @@
 #import <CoreGraphics/CGEvent.h>
 
 // NX 媒体键码(IOKit/hidsystem/ev_keymap.h 摘录)
-enum { NX_KEYTYPE_PLAY = 16, NX_KEYTYPE_FAST = 19, NX_KEYTYPE_REWIND = 20 };
+enum {
+    NX_KEYTYPE_PLAY = 16, NX_KEYTYPE_NEXT = 17, NX_KEYTYPE_PREVIOUS = 18,
+    NX_KEYTYPE_FAST = 19, NX_KEYTYPE_REWIND = 20,
+};
 
 static NSString * const StripID   = @"com.github.alty.tbl.strip";
 static NSString * const PrevID    = @"com.github.alty.tbl.prev";
@@ -113,8 +116,11 @@ NS_ASSUME_NONNULL_BEGIN
     [NSTouchBar minimizeSystemModalTouchBar:self.touchBar];
 }
 
-#pragma mark - 媒体键(⏮ ⏯ ⏭ 经系统媒体键控制网易云)
+#pragma mark - 播放控制(MRMediaRemoteSendCommand,HID 媒体键兜底)
 
+// MRCommand 枚举(LyricsX mediaremote-adapter-framework 同款):
+// kMRPlay=0 kMRPause=1 kMRTogglePlayPause=2 kMRNextTrack=4 kMRPreviousTrack=5
+// 注意:HID 媒体键(16/17-20)对网易云的切歌无效,必须走 SendCommand。
 static void postMediaKey(int key) {
     for (int down = 1; down >= 0; down--) {
         NSEvent *e = [NSEvent otherEventWithType:NSEventTypeSystemDefined
@@ -126,9 +132,12 @@ static void postMediaKey(int key) {
         if (e.CGEvent) CGEventPost(kCGHIDEventTap, e.CGEvent);
     }
 }
-- (void)togglePlay:(id)sender { postMediaKey(NX_KEYTYPE_PLAY);   }
-- (void)nextTrack:(id)sender  { postMediaKey(NX_KEYTYPE_FAST);   }
-- (void)prevTrack:(id)sender  { postMediaKey(NX_KEYTYPE_REWIND); }
+- (void)sendOrKey:(int)cmd key:(int)key {
+    if (![TBMediaRemote sendCommand:cmd]) postMediaKey(key);
+}
+- (void)togglePlay:(id)sender { [self sendOrKey:2 key:NX_KEYTYPE_PLAY];   }
+- (void)nextTrack:(id)sender  { [self sendOrKey:4 key:NX_KEYTYPE_NEXT];   }
+- (void)prevTrack:(id)sender  { [self sendOrKey:5 key:NX_KEYTYPE_PREVIOUS]; }
 
 #pragma mark - 播放信息 → 歌词同步
 
