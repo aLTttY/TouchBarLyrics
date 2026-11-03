@@ -223,9 +223,7 @@ static void postMediaKey(int key) {
     if (idx != self.currentLine) self.currentLine = idx;
     TBLyricLine *line = idx >= 0 ? self.lines[idx] : nil;
     NSString *text = line ? line.text : @"♪";
-    [self render:self.playing
-        ? [NSString stringWithFormat:@"  %@  ", text]
-        : [NSString stringWithFormat:@"⏸ %@", text]];
+    [self render:[NSString stringWithFormat:@"  %@  ", text]];
 }
 
 - (void)render:(NSString *)s {
