@@ -37,7 +37,7 @@ launchctl unload ~/Library/LaunchAgents/com.github.alty.touchbarlyrics.plist
 ## 原理与限制
 
 - **播放信息**:`MediaRemote` 私有框架读取系统"正在播放"(歌名/歌手/时长/播放状态)
-- **进度插值**:网易云客户端不上报连续进度,只给事件时刻的快照;app 用「快照锚点 + 本地时钟推进」,快照值变化时才重新校准,避免 stale 快照把歌词拖回旧位置
+- **进度插值**:网易云客户端只在事件(切歌/拖动进度/暂停)时重发布 `(elapsed, timestamp, rate)` 快照,平时冻结。播放进度按 [LyricsX MediaRemoteAdapter](https://github.com/MxIris-LyricsX-Project/mediaremote-adapter-framework) 同款公式无状态计算:`elapsed + (now - timestamp) × rate`,每次快照重发布(含拖动)自动精确归位。**暂停判定用实时的 `IsPlaying` 信号**(字典里的 rate 是滞后的):暂停即冻结,恢复即续走;暂停期间拖动进度直接落位到新位置
 - **歌词来源**:网易云公开 Web API(搜索 + LRC),无需登录;纯音乐/无歌词歌曲显示歌名
 - **Touch Bar 接管**:`NSTouchBarItem.addSystemTrayItem`(Control Strip ♪)+ `NSTouchBar.presentSystemModalTouchBar`(全宽接管),均为私有 API,苹果未来系统更新可能使其失效
 
