@@ -18,7 +18,7 @@ NS_ASSUME_NONNULL_BEGIN
 NS_ASSUME_NONNULL_END
 
 // NowPlaying info 字典键(MediaRemote 导出的全局 CFStringRef 变量,经 dlsym 解引用)
-static NSString *kTitle, *kArtist, *kAlbum, *kElapsed, *kDuration, *kRate;
+static NSString *kTitle, *kArtist, *kAlbum, *kElapsed, *kDuration, *kRate, *kTimestamp;
 // 函数指针
 static MRGetNowPlayingInfoFn mrGetInfo;
 static MRRegisterNotificationsFn mrRegister;
@@ -51,6 +51,7 @@ static MRGetPlayingFn mrGetPlaying;
     TB_KEY(kElapsed, "kMRMediaRemoteNowPlayingInfoElapsedTime");
     TB_KEY(kDuration,"kMRMediaRemoteNowPlayingInfoDuration");
     TB_KEY(kRate,    "kMRMediaRemoteNowPlayingInfoPlaybackRate");
+    TB_KEY(kTimestamp,"kMRMediaRemoteNowPlayingInfoTimestamp");
     #undef TB_KEY
     mrGetInfo     = (MRGetNowPlayingInfoFn)dlsym(h, "MRMediaRemoteGetNowPlayingInfo");
     mrRegister    = (MRRegisterNotificationsFn)dlsym(h, "MRMediaRemoteRegisterForNowPlayingNotifications");
@@ -91,6 +92,8 @@ static MRGetPlayingFn mrGetPlaying;
             if (kElapsed)  out[@"elapsed"] = info[kElapsed];
             if (kDuration) out[@"duration"]= info[kDuration];
             if (kRate)     out[@"rate"]    = info[kRate];
+            // Timestamp:elapsed 快照的生效时刻(NSDate);真实进度 = elapsed + (now - ts) × rate
+            if (kTimestamp) out[@"timestamp"] = info[kTimestamp];
         }
         BOOL hasTitle = [(out[@"title"] ?: @"") length] > 0;
         // 播放状态:IsPlaying 更准;拿不到时用 rate>0 兜底

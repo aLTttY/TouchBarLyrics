@@ -33,10 +33,11 @@ NS_ASSUME_NONNULL_BEGIN
 // 播放状态
 @property (nonatomic, copy, nullable) NSString *title, *artist;
 @property (nonatomic, assign) BOOL playing;
-// elapsed 插值锚点:网易云只在事件时上报进度快照,播放中需本地推进
-@property (nonatomic, assign) double anchorElapsed;
-@property (nonatomic, assign) CFAbsoluteTime anchorTime;
-@property (nonatomic, assign) double lastSnapshotElapsed;
+// 进度快照:MediaRemote 的 (elapsed, timestamp, rate)。网易云只在事件
+// (切歌/拖动进度/暂停)时重发布快照,平时冻结;真实进度无状态计算:
+//   position = elapsed + (now - timestamp) × rate
+// 每次重发布(含拖动)都精确归位,不再需要锚点启发式。
+@property (nonatomic, assign) double snapElapsed, snapTS, snapRate;
 @property (nonatomic, assign) BOOL hasSnapshot;
 // 歌词
 @property (nonatomic, copy, nullable) NSArray<TBLyricLine *> *lines;
@@ -138,6 +139,8 @@ static void postMediaKey(int key) {
     NSString *artist = [info[@"artist"] isKindOfClass:[NSString class]] ? info[@"artist"] : nil;
     NSNumber *elapsed = [info[@"elapsed"] isKindOfClass:[NSNumber class]] ? info[@"elapsed"] : nil;
     NSNumber *playingNum = [info[@"playing"] isKindOfClass:[NSNumber class]] ? info[@"playing"] : nil;
+    NSNumber *rateNum  = [info[@"rate"] isKindOfClass:[NSNumber class]] ? info[@"rate"] : nil;
+    NSDate   *tsDate   = [info[@"timestamp"] isKindOfClass:[NSDate class]] ? info[@"timestamp"] : nil;
 
     BOOL songChanged = NO;
     if (title.length && ![title isEqualToString:self.title ?: @""]) {
@@ -147,44 +150,27 @@ static void postMediaKey(int key) {
         self.lines = nil;
         self.lyricsLoaded = NO;
         self.currentLine = -1;
-        // 切歌:进度直接锚定到新快照
-        self.anchorElapsed = elapsed ? elapsed.doubleValue : 0;
-        self.anchorTime = CFAbsoluteTimeGetCurrent();
     }
-    BOOL playing = playingNum ? playingNum.boolValue : YES;
-    if (elapsed) [self reconcileElapsed:elapsed.doubleValue playing:playing];
+    // 记录最新快照。切歌过渡期可能短暂出现新歌名 + 旧进度(网易云分两步
+    // 更新字典),下一次重发布即自行修正,无需特判。
+    if (elapsed) {
+        self.snapElapsed = elapsed.doubleValue;
+        self.snapRate    = rateNum ? rateNum.doubleValue : 1.0;
+        self.snapTS      = tsDate ? tsDate.timeIntervalSince1970
+                                  : [NSDate date].timeIntervalSince1970;
+        self.hasSnapshot = YES;
+    }
+    if (playingNum) self.playing = playingNum.boolValue;
 
     if (songChanged) [self fetchLyrics];
     [self refreshLine];
 }
 
-/// 用新快照校准插值锚点。
-/// 网易云的 elapsed 快照经常长时间不变(stale),因此只有当快照值本身出现
-/// 变化(首次 / 切歌 / 拖动进度 / 客户端补报)时才重新锚定;快照不变则信任
-/// 本地插值继续推进。
-- (void)reconcileElapsed:(double)snapshot playing:(BOOL)playing {
-    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (!self.hasSnapshot || fabs(snapshot - self.lastSnapshotElapsed) > 0.3) {
-        self.anchorElapsed = snapshot;
-        self.anchorTime = now;
-        self.lastSnapshotElapsed = snapshot;
-        self.hasSnapshot = YES;
-    } else if (playing && !self.playing) {
-        // 暂停 → 播放:从冻结点继续走
-        self.anchorTime = now;
-    } else if (!playing && self.playing) {
-        // 播放 → 暂停:冻结在当前推进点
-        self.anchorElapsed = [self displayElapsed];
-        self.anchorTime = now;
-    }
-    self.playing = playing;
-}
-
-/// 插值后的当前播放进度
+/// 无状态计算当前播放进度(见 snapElapsed 属性注释)
 - (double)displayElapsed {
-    return self.playing
-        ? self.anchorElapsed + (CFAbsoluteTimeGetCurrent() - self.anchorTime)
-        : self.anchorElapsed;
+    if (!self.hasSnapshot) return 0;
+    double rate = self.snapRate > 0 ? self.snapRate : 1.0;
+    return self.snapElapsed + ([[NSDate date] timeIntervalSince1970] - self.snapTS) * rate;
 }
 
 - (void)fetchLyrics {
