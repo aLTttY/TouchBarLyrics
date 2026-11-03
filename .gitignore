@@ -1,0 +1,9 @@
+# 构建产物
+TouchBarLyrics.app/
+*.o
+*.dSYM/
+
+# 原型代码(未整理,不随仓库分发)
+proto/
+
+.DS_Store
