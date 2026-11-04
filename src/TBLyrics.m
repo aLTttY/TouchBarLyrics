@@ -30,16 +30,17 @@ NS_ASSUME_NONNULL_BEGIN
 }
 
 - (void)lyricsForTitle:(NSString *)title artist:(nullable NSString *)artist
+              duration:(double)durationSec
             completion:(TBLyricsCallback)completion {
     NSString *key = [NSString stringWithFormat:@"%@|%@", title, artist ?: @""];
     NSArray<TBLyricLine *> *hit = [self.cache objectForKey:key];
     if (hit) { dispatch_async(dispatch_get_main_queue(), ^{ completion(hit); }); return; }
 
     NSString *query = artist.length ? [NSString stringWithFormat:@"%@ %@", title, artist] : title;
-    [self search:query completion:^(NSNumber *_Nullable songId) {
+    [self search:query targetDuration:durationSec completion:^(NSNumber *_Nullable songId) {
         // 乐队/歌手名干扰时退化为仅歌名搜索
         if (!songId) {
-            [self search:title completion:^(NSNumber *_Nullable fallbackId) {
+            [self search:title targetDuration:durationSec completion:^(NSNumber *_Nullable fallbackId) {
                 [self fetch:songId ?: fallbackId key:key completion:completion];
             }];
             return;
@@ -50,27 +51,44 @@ NS_ASSUME_NONNULL_BEGIN
 
 #pragma mark - 网络请求
 
-- (void)search:(NSString *)query completion:(void (^)(NSNumber *_Nullable songId))completion {
+- (void)search:(NSString *)query targetDuration:(double)targetSec
+     completion:(void (^)(NSNumber *_Nullable songId))completion {
     NSString *urlStr = [NSString stringWithFormat:
         @"https://music.163.com/api/search/get/web?s=%@&type=1&limit=8",
         [query stringByAddingPercentEncodingWithAllowedCharacters:
             [NSCharacterSet URLQueryAllowedCharacterSet]]];
     [self getJSON:urlStr completion:^(id _Nullable json) {
-        NSNumber *songId = nil;
         NSArray *songs = json[@"result"][@"songs"];
-        if ([songs isKindOfClass:[NSArray class]]) {
-            for (NSDictionary *song in songs) {
-                NSString *name = song[@"name"];
-                if (![name isKindOfClass:[NSString class]]) continue;
-                // 精确同名优先,否则取第一个
-                if (!songId) {
-                    id sid = song[@"id"];
-                    if ([sid isKindOfClass:[NSNumber class]]) songId = sid;
-                }
-                if ([name isEqualToString:query] || [name isEqualToString:[query componentsSeparatedByString:@" "].firstObject]) break;
+        if (![songs isKindOfClass:[NSArray class]]) { completion(nil); return; }
+        // 挑选策略:精确同名优先;同名或全部候选中再挑时长最接近的
+        // (翻唱/伴奏/现场版时长差异明显),避免搜到错误版本。
+        NSNumber *exact = nil, *exactDur = nil, *anyBest = nil, *anyBestDur = nil;
+        double anyBestDiff = 1e9;
+        for (NSDictionary *song in songs) {
+            NSString *name = song[@"name"];
+            if (![name isKindOfClass:[NSString class]]) continue;
+            id sid = song[@"id"];
+            if (![sid isKindOfClass:[NSNumber class]]) continue;
+            id durVal = song[@"duration"];
+            double dur = [durVal isKindOfClass:[NSNumber class]] ? durVal.doubleValue / 1000.0 : 0;
+            double diff = (targetSec > 1 && dur > 1) ? fabs(dur - targetSec) : 0;
+            BOOL exactName = [name isEqualToString:query];
+            if (exactName && !exact) { exact = sid; exactDur = @(dur); if (diff == 0) break; continue; }
+            if (exactName && diff < 1e8) {
+                double cur = exactDur ? exactDur.doubleValue : 0;
+                if (targetSec > 1 && dur > 1 && diff < fabs(cur - targetSec)) { exact = sid; exactDur = @(dur); }
+            }
+            if (targetSec > 1 && dur > 1 && diff < anyBestDiff) {
+                anyBestDiff = diff; anyBest = sid; anyBestDur = @(dur);
             }
         }
-        completion(songId);
+        // 精确同名但时长偏差过大(>8s)且存在时长更接近的候选 → 用时长最近者
+        if (exact && targetSec > 1) {
+            double d = exactDur ? fabs(exactDur.doubleValue - targetSec) : 1e9;
+            if (d > 8 && anyBest && anyBestDiff < d) exact = anyBest;
+        }
+        if (!exact) exact = anyBest;
+        completion(exact);
     }];
 }
 

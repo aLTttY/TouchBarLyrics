@@ -40,7 +40,7 @@ NS_ASSUME_NONNULL_BEGIN
 // (切歌/拖动进度/暂停)时重发布快照,平时冻结;推进公式(同 LyricsX
 // MediaRemoteAdapter):position = elapsed + (now - timestamp) × rate。
 // 暂停判定不用字典 rate(滞后),用实时的 IsPlaying:为假则冻结在 lastPos。
-@property (nonatomic, assign) double snapElapsed, snapTS, snapRate;
+@property (nonatomic, assign) double snapElapsed, snapTS, snapRate, snapDuration;
 @property (nonatomic, assign) BOOL hasSnapshot;
 @property (nonatomic, assign) double lastPos;
 @property (nonatomic, assign) BOOL snapDirty;
@@ -68,14 +68,16 @@ NS_ASSUME_NONNULL_BEGIN
 
     [self render:@"未在播放"];
     // 锁屏/熄屏会清掉 system modal 展示;解锁/唤醒后重新注册 + 展开
-    static id obs1 = nil, obs2 = nil;
+    static NSArray<id> *observers = nil;
     NSWorkspace *ws = [NSWorkspace sharedWorkspace];
-    obs1 = [ws.notificationCenter addObserverForName:NSWorkspaceSessionDidBecomeActiveNotification
-                                              object:nil queue:[NSOperationQueue mainQueue]
-                                         usingBlock:^(NSNotification *n) { [self registerStripAndPresent]; }];
-    obs2 = [ws.notificationCenter addObserverForName:NSWorkspaceScreensDidWakeNotification
-                                              object:nil queue:[NSOperationQueue mainQueue]
-                                         usingBlock:^(NSNotification *n) { [self registerStripAndPresent]; }];
+    observers = @[
+        [ws.notificationCenter addObserverForName:NSWorkspaceSessionDidBecomeActiveNotification
+                                           object:nil queue:[NSOperationQueue mainQueue]
+                                      usingBlock:^(NSNotification *n) { [self registerStripAndPresent]; }],
+        [ws.notificationCenter addObserverForName:NSWorkspaceScreensDidWakeNotification
+                                           object:nil queue:[NSOperationQueue mainQueue]
+                                      usingBlock:^(NSNotification *n) { [self registerStripAndPresent]; }],
+    ];
     [TBMediaRemote.shared startWithHandler:^(NSDictionary *_Nullable info) {
         [self onNowPlaying:info];
     }];
@@ -190,12 +192,14 @@ static void postMediaKey(int key) {
         double e  = elapsed.doubleValue;
         double ts = tsDate ? tsDate.timeIntervalSince1970
                            : [NSDate date].timeIntervalSince1970;
+        NSNumber *durNum = [info[@"duration"] isKindOfClass:[NSNumber class]] ? info[@"duration"] : nil;
         if (!self.hasSnapshot || e != self.snapElapsed || ts != self.snapTS) {
-            self.snapElapsed = e;
-            self.snapRate    = rateNum ? rateNum.doubleValue : 1.0;
-            self.snapTS      = ts;
-            self.hasSnapshot = YES;
-            self.snapDirty   = YES;   // 快照重发布(含拖动进度),允许重新计算
+            self.snapElapsed  = e;
+            self.snapRate     = rateNum ? rateNum.doubleValue : 1.0;
+            self.snapTS       = ts;
+            self.snapDuration = durNum ? durNum.doubleValue : 0;
+            self.hasSnapshot  = YES;
+            self.snapDirty    = YES;   // 快照重发布(含拖动进度),允许重新计算
         }
     }
     BOOL wasPlaying = self.playing;
@@ -223,7 +227,7 @@ static void postMediaKey(int key) {
     if (self.lyricsPending || !self.title.length) return;
     self.lyricsPending = YES;
     NSString *title = self.title, *artist = self.artist;
-    [TBLyrics.shared lyricsForTitle:title artist:artist
+    [TBLyrics.shared lyricsForTitle:title artist:artist duration:self.snapDuration
                          completion:^(NSArray<TBLyricLine *> *_Nullable lines) {
         // 期间切歌则丢弃本次结果
         if (![title isEqualToString:self.title ?: @""]) return;
