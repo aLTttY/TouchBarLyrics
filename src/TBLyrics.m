@@ -70,7 +70,8 @@ NS_ASSUME_NONNULL_BEGIN
             id sid = song[@"id"];
             if (![sid isKindOfClass:[NSNumber class]]) continue;
             id durVal = song[@"duration"];
-            double dur = [durVal isKindOfClass:[NSNumber class]] ? durVal.doubleValue / 1000.0 : 0;
+            double dur = [durVal isKindOfClass:[NSNumber class]]
+                ? [(NSNumber *)durVal doubleValue] / 1000.0 : 0;
             double diff = (targetSec > 1 && dur > 1) ? fabs(dur - targetSec) : 0;
             BOOL exactName = [name isEqualToString:query];
             if (exactName && !exact) { exact = sid; exactDur = @(dur); if (diff == 0) break; continue; }
