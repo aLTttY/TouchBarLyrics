@@ -3,6 +3,7 @@
 #import "TBMediaRemote.h"
 #import "TBLyrics.h"
 #import <AppKit/AppKit.h>
+#import <QuartzCore/QuartzCore.h>
 #import <CoreGraphics/CGEvent.h>
 
 // NX 媒体键码(IOKit/hidsystem/ev_keymap.h 摘录)
@@ -19,20 +20,68 @@ static NSString * const LyricsID  = @"com.github.alty.tbl.lyrics";
 
 NS_ASSUME_NONNULL_BEGIN
 
-// 固定尺寸的歌词条容器:系统的 item 布局按顶层视图的 intrinsicContentSize 定宽,
-// 内部按钮用 autoresizing 填满 —— 不让系统直接布局按钮,避免 frame 被压成 0
+// 固定尺寸的歌词条容器:系统的 item 布局按顶层视图的 intrinsicContentSize 定宽。
+// 文本用 CATextLayer 渲染,超出宽度时来回滚动(marquee)。
 @interface TBLyricsContainer : NSView
-@property (nonatomic, strong) NSButton *button;
+@property (nonatomic, strong) CATextLayer *textLayer;
+@property (nonatomic, strong) NSFont *font;
+@property (nonatomic, copy) NSString *currentText;
 @end
 @implementation TBLyricsContainer
+- (instancetype)initWithFrame:(NSRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.wantsLayer = YES;
+        self.layer.masksToBounds = YES;
+        self.textLayer = [CATextLayer layer];
+        self.textLayer.contentsScale = 2;   // Touch Bar 屏为 2x
+        self.textLayer.anchorPoint = CGPointMake(0, 0.5);
+        [self.layer addSublayer:self.textLayer];
+        self.font = [NSFont monospacedDigitSystemFontOfSize:15 weight:NSFontWeightRegular];
+    }
+    return self;
+}
 - (CGSize)intrinsicContentSize { return CGSizeMake(360, 30); }
-- (void)layout { self.button.frame = self.bounds; [super layout]; }
+
+- (void)setLyricsText:(NSString *)s {
+    if (!s || [s isEqualToString:self.currentText]) return;
+    self.currentText = s;
+    NSAttributedString *as = [[NSAttributedString alloc] initWithString:s attributes:@{
+        NSFontAttributeName: self.font,
+        NSForegroundColorAttributeName: NSColor.whiteColor,
+    }];
+    CGFloat w = ceil(as.size.width) + 4, h = ceil(as.size.height);
+    CGFloat barW = self.bounds.size.width, pad = 8;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];   // 换行时禁止隐式动画
+    self.textLayer.string = as;
+    self.textLayer.bounds = CGRectMake(0, 0, w, h);
+    self.textLayer.position = CGPointMake(pad, 15);   // anchor(0,0.5) → 纵向居中
+    [self.textLayer removeAnimationForKey:@"marquee"];
+    if (w <= barW - pad * 2) {
+        // 放得下:水平居中
+        self.textLayer.position = CGPointMake((barW - w) / 2, 15);
+    } else {
+        // 放不下:从左缘滚到露出尾部,再滚回来,循环
+        CGFloat travel = w - (barW - pad * 2);
+        self.textLayer.position = CGPointMake(pad, 15);
+        CABasicAnimation *a = [CABasicAnimation animationWithKeyPath:@"position.x"];
+        a.fromValue = @(pad);
+        a.toValue = @(pad - travel);
+        a.duration = MAX(4, travel / 25.0);   // 约 25pt/s,过快看不清
+        a.autoreverses = YES;
+        a.repeatCount = HUGE_VALF;
+        a.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+        [self.textLayer addAnimation:a forKey:@"marquee"];
+    }
+    [CATransaction commit];
+}
 @end
 
 @interface TBTouchBarController ()
 @property (nonatomic, strong) NSTouchBar *touchBar;
 @property (nonatomic, strong) NSCustomTouchBarItem *lyricsItem;
-@property (nonatomic, strong) NSButton *lyricsLabel;
+@property (nonatomic, strong) TBLyricsContainer *lyricsView;
 // 播放状态
 @property (nonatomic, copy, nullable) NSString *title, *artist;
 @property (nonatomic, assign) BOOL playing;
@@ -43,7 +92,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, assign) double snapElapsed, snapTS, snapRate, snapDuration;
 @property (nonatomic, assign) BOOL hasSnapshot;
 @property (nonatomic, assign) double lastPos;
-@property (nonatomic, assign) BOOL snapDirty;
+@property (nonatomic, assign) BOOL snapDirty, everPlaying;
 // 歌词
 @property (nonatomic, copy, nullable) NSArray<TBLyricLine *> *lines;
 @property (nonatomic, assign) NSInteger currentLine;
@@ -125,11 +174,7 @@ NS_ASSUME_NONNULL_BEGIN
     NSCustomTouchBarItem *item = [[NSCustomTouchBarItem alloc] initWithIdentifier:LyricsID];
     TBLyricsContainer *container = [[TBLyricsContainer alloc]
         initWithFrame:NSMakeRect(0, 0, 360, 30)];
-    NSButton *label = [NSButton buttonWithTitle:@"" target:nil action:nil];
-    label.font = [NSFont monospacedDigitSystemFontOfSize:15 weight:NSFontWeightRegular];
-    container.button = label;
-    [container addSubview:label];
-    self.lyricsLabel = label;
+    self.lyricsView = container;
     item.view = container;
     return item;
 }
@@ -204,9 +249,19 @@ static void postMediaKey(int key) {
             self.snapDirty    = YES;   // 快照重发布(含拖动进度),允许重新计算
         }
     }
-    BOOL wasPlaying = self.playing;
-    if (playingNum) self.playing = playingNum.boolValue;
-    if (self.playing && !wasPlaying) self.snapDirty = YES;   // 恢复播放立即续走
+    BOOL wasPlaying = self.playing, wasEver = self.everPlaying;
+    if (playingNum) {
+        self.playing = playingNum.boolValue;
+        if (self.playing) self.everPlaying = YES;
+    }
+    // 恢复播放:网易云未必重发快照,旧 timestamp 含整段暂停时长,会让歌词
+    // 大幅超前(如暂停 3 分钟则超前 3 分钟)。以冻结位置为基准重置插值时钟。
+    // (app 启动首帧 wasEver=NO,跳过以免覆盖真实快照)
+    if (self.playing && !wasPlaying && wasEver && self.hasSnapshot) {
+        self.snapElapsed = self.lastPos;
+        self.snapTS = [[NSDate date] timeIntervalSince1970];
+        self.snapDirty = YES;
+    }
 
     if (songChanged) [self fetchLyrics];
     [self refreshLine];
@@ -218,8 +273,12 @@ static void postMediaKey(int key) {
     if (!self.hasSnapshot) return 0;
     if (self.playing || self.snapDirty) {
         double rate = self.snapRate > 0 ? self.snapRate : 1.0;
-        self.lastPos = self.snapElapsed
+        double pos = self.snapElapsed
             + ([[NSDate date] timeIntervalSince1970] - self.snapTS) * rate;
+        // 歌已结束但快照未更新时钳在末尾,防止越界
+        if (self.snapDuration > 1 && pos > self.snapDuration - 0.5) pos = self.snapDuration - 0.5;
+        if (pos < 0) pos = 0;
+        self.lastPos = pos;
         self.snapDirty = NO;
     }
     return self.lastPos;
@@ -264,10 +323,9 @@ static void postMediaKey(int key) {
 }
 
 - (void)render:(NSString *)s {
-    // 同文本不刷,减少 Touch Bar 重绘
-    if ([self.lyricsLabel.title isEqualToString:s]) return;
-    [self.lyricsLabel performSelectorOnMainThread:@selector(setTitle:)
-                                        withObject:s waitUntilDone:NO];
+    // 同文本不刷,减少 Touch Bar 重绘(去重逻辑在 container 内部)
+    [self.lyricsView performSelectorOnMainThread:@selector(setLyricsText:)
+                                      withObject:s waitUntilDone:NO];
 }
 
 @end

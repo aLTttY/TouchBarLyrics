@@ -62,7 +62,7 @@ NS_ASSUME_NONNULL_BEGIN
         if (![songs isKindOfClass:[NSArray class]]) { completion(nil); return; }
         // 挑选策略:精确同名优先;同名或全部候选中再挑时长最接近的
         // (翻唱/伴奏/现场版时长差异明显),避免搜到错误版本。
-        NSNumber *exact = nil, *exactDur = nil, *anyBest = nil, *anyBestDur = nil;
+        NSNumber *exact = nil, *exactDur = nil, *anyBest = nil;
         double anyBestDiff = 1e9;
         for (NSDictionary *song in songs) {
             NSString *name = song[@"name"];
@@ -80,7 +80,7 @@ NS_ASSUME_NONNULL_BEGIN
                 if (targetSec > 1 && dur > 1 && diff < fabs(cur - targetSec)) { exact = sid; exactDur = @(dur); }
             }
             if (targetSec > 1 && dur > 1 && diff < anyBestDiff) {
-                anyBestDiff = diff; anyBest = sid; anyBestDur = @(dur);
+                anyBestDiff = diff; anyBest = sid;
             }
         }
         // 精确同名但时长偏差过大(>8s)且存在时长更接近的候选 → 用时长最近者
