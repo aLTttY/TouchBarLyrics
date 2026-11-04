@@ -97,8 +97,8 @@ NS_ASSUME_NONNULL_BEGIN
 // 菜单栏歌词同步(地面真值)
 @property (nonatomic, assign) NSInteger hintIdx;
 @property (nonatomic, assign) NSInteger hintNoMatch;
+@property (nonatomic, assign) NSInteger pendingHintIdx;
 @property (nonatomic, assign) CFAbsoluteTime lastAnchorWall;
-@property (nonatomic, copy) NSString *lastFallbackCand;
 // 歌词
 @property (nonatomic, copy, nullable) NSArray<TBLyricLine *> *lines;
 @property (nonatomic, assign) NSInteger currentLine;
@@ -243,6 +243,7 @@ static void postMediaKey(int key) {
         self.lyricsLoaded = NO;
         self.currentLine = -1;
         self.hintIdx = NSNotFound;
+        self.pendingHintIdx = NSNotFound;
         self.hintNoMatch = 0;
     }
     // 记录最新快照。切歌过渡期可能短暂出现新歌名 + 旧进度(网易云分两步
@@ -392,27 +393,17 @@ static BOOL TBLyricLike(NSString *s) {
     return (cjk >= 2) || (letters >= 4 && bestRun >= 4);
 }
 
-/// 用菜单栏歌词校准播放位置。OCR 候选逐个对 LRC 行模糊匹配(取离当前位置
-/// 最近的命中行),命中行变化时把位置锚定到该行时间;重复副歌不会跳回开头。
-/// 全部匹配不上(网易云用了不同版本歌词)且候选稳定时,直接显示 OCR 文本兜底。
+/// 用菜单栏歌词校准播放位置(LRC 白名单制):
+/// OCR 候选必须模糊匹配上当前 LRC 的某一行才被采信,其它一律是垃圾不显示。
+/// 同一行需连续两轮命中才切换锚点(单帧误读不产生任何影响 = 不闪)。
+/// 全程匹配不上(网易云歌词版本与我们的不同)则退回快照公式同步。
 - (void)applyLyricHint:(NSArray<NSString *> *)candidates {
-    if (!self.playing) return;
-    NSMutableArray<NSString *> *pool = [NSMutableArray array];
-    for (NSString *c in candidates) if (TBLyricLike(c)) [pool addObject:c];
-    if (!pool.count) return;
-
-    if (!self.lines) {
-        // 没抓到我们自己的歌词:显示稳定的歌词候选(连续两轮相同才上屏)
-        NSString *c = pool.firstObject;
-        if ([c isEqualToString:self.lastFallbackCand])
-            [self render:[NSString stringWithFormat:@"  %@  ", c]];
-        self.lastFallbackCand = c;
-        return;
-    }
+    if (!self.playing || !self.lines) return;
     double pos = [self displayElapsed];
     NSInteger bestIdx = NSNotFound;
     double bestDist = 1e9;
-    for (NSString *c in pool) {
+    for (NSString *c in candidates) {
+        if (!TBLyricLike(c)) continue;
         for (NSInteger i = 0; i < (NSInteger)self.lines.count; i++) {
             NSString *t = self.lines[i].text;
             if (t.length < 2 || [t isEqualToString:@"♪"]) continue;
@@ -422,18 +413,19 @@ static BOOL TBLyricLike(NSString *s) {
         }
     }
     if (bestIdx == NSNotFound) {
-        // 连续多轮匹配不上且候选稳定:显示 OCR 文本兜底(网易云版本与我们的不同)
-        self.hintNoMatch++;
-        NSString *c = pool.firstObject;
-        if (self.hintNoMatch >= 6 && self.hintIdx == NSNotFound &&
-            [c isEqualToString:self.lastFallbackCand])
-            [self render:[NSString stringWithFormat:@"  %@  ", c]];
-        self.lastFallbackCand = c;
+        // 单轮失败不改变任何状态(抗闪烁);长时间全 miss 才软重置
+        if (++self.hintNoMatch >= 20) {
+            self.hintIdx = NSNotFound;
+            self.pendingHintIdx = NSNotFound;
+            self.hintNoMatch = 0;
+        }
         return;
     }
     self.hintNoMatch = 0;
-    self.lastFallbackCand = nil;
-    if (bestIdx == self.hintIdx) return;
+    if (bestIdx == self.hintIdx) { self.pendingHintIdx = NSNotFound; return; }
+    // 二次确认:上一轮也命中同一行才切换(单帧误读不锚)
+    if (self.pendingHintIdx != bestIdx) { self.pendingHintIdx = bestIdx; return; }
+    self.pendingHintIdx = NSNotFound;
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     if (self.hintIdx != NSNotFound && now - self.lastAnchorWall < 0.5) return;   // 防抖
     self.hintIdx = bestIdx;
