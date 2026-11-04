@@ -68,6 +68,7 @@ NS_ASSUME_NONNULL_BEGIN
 
     [self render:@"未在播放"];
     // 锁屏/熄屏会清掉 system modal 展示;解锁/唤醒后重新注册 + 展开
+    // (observer token 保存在静态数组中,app 生命周期内不移除)
     static NSArray<id> *observers = nil;
     NSWorkspace *ws = [NSWorkspace sharedWorkspace];
     observers = @[
@@ -78,6 +79,7 @@ NS_ASSUME_NONNULL_BEGIN
                                            object:nil queue:[NSOperationQueue mainQueue]
                                       usingBlock:^(NSNotification *n) { [self registerStripAndPresent]; }],
     ];
+    (void)observers;   // token 仅用于延长生命周期
     [TBMediaRemote.shared startWithHandler:^(NSDictionary *_Nullable info) {
         [self onNowPlaying:info];
     }];
