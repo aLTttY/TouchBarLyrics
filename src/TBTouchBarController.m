@@ -139,8 +139,8 @@ NS_ASSUME_NONNULL_BEGIN
         [self onNowPlaying:info];
     }];
     // 菜单栏歌词 = 网易云自己算的进度,是最佳同步基准
-    [[TBMenuBarLyric shared] startWithHandler:^(NSString *_Nullable text) {
-        [self applyLyricHint:text];
+    [[TBMenuBarLyric shared] startWithHandler:^(NSArray<NSString *> *_Nullable candidates) {
+        [self applyLyricHint:candidates];
     }];
 }
 
