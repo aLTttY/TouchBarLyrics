@@ -54,13 +54,6 @@ NS_ASSUME_NONNULL_BEGIN
 
 - (void)start {
     [NSTouchBarItem class]; // 确保链接 AppKit 后私有类别生效
-    // Control Strip 常驻 ♪ 按钮:点击展开歌词
-    NSCustomTouchBarItem *strip = [[NSCustomTouchBarItem alloc] initWithIdentifier:StripID];
-    NSButton *stripBtn = [NSButton buttonWithTitle:@"♪" target:self action:@selector(presentLyrics:)];
-    strip.view = stripBtn;
-    [NSTouchBarItem addSystemTrayItem:strip];
-    tbl_DFRSetControlStripPresence(StripID, YES);
-
     // 歌词条:[⏮][⏯][⏭][ ——— 歌词 ——— ];收起用左侧系统 ✕ 或再点 ♪
     self.touchBar = [[NSTouchBar alloc] init];
     self.touchBar.templateItems = [NSSet setWithArray:@[
@@ -69,16 +62,45 @@ NS_ASSUME_NONNULL_BEGIN
     ]];
     self.touchBar.defaultItemIdentifiers = @[PrevID, PlayID, NextID, LyricsID];
 
+    // Control Strip ♪ 注册 + 展开:开机瞬间 DFR 服务可能未就绪导致注册
+    // 静默失败,故注册后自检 presence,未生效则重试
+    [self registerStripAndPresent];
+
     [self render:@"未在播放"];
-    [self presentLyrics:nil];   // 启动即展开;之后仅 ♪ / ✕ 改变展开状态
-    // 锁屏/解锁或切用户会话后,系统的 system modal 展示会被清掉,重新展开
-    [[NSWorkspace sharedWorkspace].notificationCenter
-        addObserverForName:NSWorkspaceSessionDidBecomeActiveNotification
-                    object:nil queue:[NSOperationQueue mainQueue]
-                usingBlock:^(NSNotification *n) { [self presentLyrics:nil]; }];
+    // 锁屏/熄屏会清掉 system modal 展示;解锁/唤醒后重新注册 + 展开
+    static id obs1 = nil, obs2 = nil;
+    NSWorkspace *ws = [NSWorkspace sharedWorkspace];
+    obs1 = [ws.notificationCenter addObserverForName:NSWorkspaceSessionDidBecomeActiveNotification
+                                              object:nil queue:[NSOperationQueue mainQueue]
+                                         usingBlock:^(NSNotification *n) { [self registerStripAndPresent]; }];
+    obs2 = [ws.notificationCenter addObserverForName:NSWorkspaceScreensDidWakeNotification
+                                              object:nil queue:[NSOperationQueue mainQueue]
+                                         usingBlock:^(NSNotification *n) { [self registerStripAndPresent]; }];
     [TBMediaRemote.shared startWithHandler:^(NSDictionary *_Nullable info) {
         [self onNowPlaying:info];
     }];
+}
+
+/// 注册 ♪ 到 Control Strip 并展开歌词条;presence 未生效时最多重试 30 次
+- (void)registerStripAndPresent {
+    static NSCustomTouchBarItem *stripItem = nil;
+    static int retryCount = 0;
+    if (!stripItem) {
+        stripItem = [[NSCustomTouchBarItem alloc] initWithIdentifier:StripID];
+        stripItem.view = [NSButton buttonWithTitle:@"♪" target:self action:@selector(presentLyrics:)];
+        [NSTouchBarItem addSystemTrayItem:stripItem];
+    }
+    tbl_DFRSetControlStripPresence(StripID, YES);
+    [self presentLyrics:nil];
+
+    BOOL present = tbl_DFRGetControlStripPresence ? tbl_DFRGetControlStripPresence(StripID) : YES;
+    if (!present && retryCount < 30) {
+        retryCount++;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ [self registerStripAndPresent]; });
+        return;
+    }
+    retryCount = 0;
 }
 
 #pragma mark - Touch Bar item 组装

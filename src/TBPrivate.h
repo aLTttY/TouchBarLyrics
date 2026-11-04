@@ -24,8 +24,10 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// dlopen DFRFoundation 并解析所需 C 函数;失败返回 NO(此时 Touch Bar 无法接管)
 BOOL TBLoadDFRFoundation(void);
-/// 声明:void DFRElementSetControlStripPresenceForIdentifier(id, BOOL)
+/// 声明:void DFRElementSetControlStripPresenceForIdentifier(id identifier, BOOL presence)
 extern void (*tbl_DFRSetControlStripPresence)(id identifier, BOOL presence) __attribute__((visibility("default")));
+/// 声明:BOOL DFRElementGetControlStripPresenceForIdentifier(id identifier)
+extern BOOL (*tbl_DFRGetControlStripPresence)(id identifier) __attribute__((visibility("default")));
 /// 声明:void DFRSystemModalShowsCloseBoxWhenFrontMost(BOOL)
 extern void (*tbl_DFRCloseBox)(BOOL) __attribute__((visibility("default")));
 
