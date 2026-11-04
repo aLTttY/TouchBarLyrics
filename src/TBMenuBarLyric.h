@@ -9,8 +9,9 @@ NS_ASSUME_NONNULL_BEGIN
 
 @interface TBMenuBarLyric : NSObject
 + (instancetype)shared;
-/// 开始轮询;handler 在主线程回调,形参为当前菜单栏文本(可能为 nil = 本次没读到)。
-- (void)startWithHandler:(void (^)(NSString *_Nullable text))handler;
+/// 开始轮询;handler 在主线程回调,形参为本轮识别出的全部文本候选
+/// (已滤掉过短/低置信度;可能为 nil = 本次没读到)。
+- (void)startWithHandler:(void (^)(NSArray<NSString *> *_Nullable candidates))handler;
 @end
 
 NS_ASSUME_NONNULL_END

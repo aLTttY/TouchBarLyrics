@@ -97,6 +97,8 @@ NS_ASSUME_NONNULL_BEGIN
 // 菜单栏歌词同步(地面真值)
 @property (nonatomic, assign) NSInteger hintIdx;
 @property (nonatomic, assign) NSInteger hintNoMatch;
+@property (nonatomic, assign) CFAbsoluteTime lastAnchorWall;
+@property (nonatomic, copy) NSString *lastFallbackCand;
 // 歌词
 @property (nonatomic, copy, nullable) NSArray<TBLyricLine *> *lines;
 @property (nonatomic, assign) NSInteger currentLine;
@@ -367,44 +369,81 @@ static BOOL TBFuzzyMatch(NSString *a, NSString *b) {
     return (double)hit / (double)shorter.length >= 0.6;
 }
 
-/// 用菜单栏歌词校准播放位置。OCR 文本 → LRC 行匹配 → 锚定该行时间。
-/// 完全匹配不上时(网易云用了不同版本歌词),直接显示 OCR 文本兜底。
-- (void)applyLyricHint:(NSString *)hint {
+/// 是否为时钟/日期类菜单栏垃圾(11月4日周三 20:12 之类)
+static BOOL TBJunkText(NSString *s) {
+    static NSRegularExpression *re = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        re = [NSRegularExpression regularExpressionWithPattern:
+            @"\\d{1,2}月\\d{1,2}日|周[一二三四五六日天]|\\d{1,2}:\\d{2}" options:0 error:NULL];
+    });
+    return [re numberOfMatchesInString:s options:0 range:NSMakeRange(0, s.length)] > 0;
+}
+/// 是否"像歌词":含 ≥2 个 CJK 字符,或 ≥4 个连续字母,且不是时钟垃圾
+static BOOL TBLyricLike(NSString *s) {
+    if (TBJunkText(s)) return NO;
+    NSInteger cjk = 0, letters = 0, run = 0, bestRun = 0;
+    for (NSUInteger i = 0; i < s.length; i++) {
+        unichar c = [s characterAtIndex:i];
+        if (c >= 0x4e00 && c <= 0x9fff) { cjk++; run = 0; }
+        else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) { run++; bestRun = MAX(bestRun, run); letters++; }
+        else run = 0;
+    }
+    return (cjk >= 2) || (letters >= 4 && bestRun >= 4);
+}
+
+/// 用菜单栏歌词校准播放位置。OCR 候选逐个对 LRC 行模糊匹配(取离当前位置
+/// 最近的命中行),命中行变化时把位置锚定到该行时间;重复副歌不会跳回开头。
+/// 全部匹配不上(网易云用了不同版本歌词)且候选稳定时,直接显示 OCR 文本兜底。
+- (void)applyLyricHint:(NSArray<NSString *> *)candidates {
     if (!self.playing) return;
+    NSMutableArray<NSString *> *pool = [NSMutableArray array];
+    for (NSString *c in candidates) if (TBLyricLike(c)) [pool addObject:c];
+    if (!pool.count) return;
+
     if (!self.lines) {
-        // 没抓到我们自己的歌词:直接显示网易云正在唱的这句(仍是同步的)
-        if (hint.length >= 2) [self render:[NSString stringWithFormat:@"  %@  ", hint]];
+        // 没抓到我们自己的歌词:显示稳定的歌词候选(连续两轮相同才上屏)
+        NSString *c = pool.firstObject;
+        if ([c isEqualToString:self.lastFallbackCand])
+            [self render:[NSString stringWithFormat:@"  %@  ", c]];
+        self.lastFallbackCand = c;
         return;
     }
-    if (!hint.length) return;
     double pos = [self displayElapsed];
     NSInteger bestIdx = NSNotFound;
     double bestDist = 1e9;
-    for (NSInteger i = 0; i < (NSInteger)self.lines.count; i++) {
-        NSString *t = self.lines[i].text;
-        if (t.length < 2 || [t isEqualToString:@"♪"]) continue;
-        if (!TBFuzzyMatch(hint, t)) continue;
-        double d = fabs(self.lines[i].time - pos);
-        if (d < bestDist) { bestDist = d; bestIdx = i; }
+    for (NSString *c in pool) {
+        for (NSInteger i = 0; i < (NSInteger)self.lines.count; i++) {
+            NSString *t = self.lines[i].text;
+            if (t.length < 2 || [t isEqualToString:@"♪"]) continue;
+            if (!TBFuzzyMatch(c, t)) continue;
+            double d = fabs(self.lines[i].time - pos);
+            if (d < bestDist) { bestDist = d; bestIdx = i; }
+        }
     }
     if (bestIdx == NSNotFound) {
-        // 连续多次匹配不上:显示 OCR 文本兜底(网易云歌词版本与我们的不同)
-        if (++self.hintNoMatch >= 6 && self.hintIdx == NSNotFound) {
-            [self render:[NSString stringWithFormat:@"  %@  ", hint]];
-        }
+        // 连续多轮匹配不上且候选稳定:显示 OCR 文本兜底(网易云版本与我们的不同)
+        self.hintNoMatch++;
+        NSString *c = pool.firstObject;
+        if (self.hintNoMatch >= 6 && self.hintIdx == NSNotFound &&
+            [c isEqualToString:self.lastFallbackCand])
+            [self render:[NSString stringWithFormat:@"  %@  ", c]];
+        self.lastFallbackCand = c;
         return;
     }
     self.hintNoMatch = 0;
-    if (bestIdx != self.hintIdx) {
-        self.hintIdx = bestIdx;
-        self.currentLine = bestIdx;
-        // 锚定到该行起始时刻,此后按快照公式推进
-        self.snapElapsed = self.lines[bestIdx].time;
-        self.snapTS = [[NSDate date] timeIntervalSince1970];
-        self.snapRate = self.snapRate > 0 ? self.snapRate : 1.0;
-        self.snapDirty = YES;
-        [self refreshLine];
-    }
+    self.lastFallbackCand = nil;
+    if (bestIdx == self.hintIdx) return;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (self.hintIdx != NSNotFound && now - self.lastAnchorWall < 0.5) return;   // 防抖
+    self.hintIdx = bestIdx;
+    self.currentLine = bestIdx;
+    self.snapElapsed = self.lines[bestIdx].time;
+    self.snapTS = [[NSDate date] timeIntervalSince1970];
+    self.snapRate = self.snapRate > 0 ? self.snapRate : 1.0;
+    self.snapDirty = YES;
+    self.lastAnchorWall = now;
+    [self refreshLine];
 }
 
 @end

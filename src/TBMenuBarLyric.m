@@ -9,7 +9,7 @@ static const NSTimeInterval kPollInterval = 0.6;
 
 @interface TBMenuBarLyric ()
 @property (nonatomic, strong) dispatch_queue_t queue;
-@property (nonatomic, copy) void (^handler)(NSString *_Nullable);
+@property (nonatomic, copy) void (^handler)(NSArray<NSString *> *_Nullable);
 @end
 
 @implementation TBMenuBarLyric
@@ -21,7 +21,7 @@ static const NSTimeInterval kPollInterval = 0.6;
     return s;
 }
 
-- (void)startWithHandler:(void (^)(NSString *_Nullable))handler {
+- (void)startWithHandler:(void (^)(NSArray<NSString *> *_Nullable))handler {
     self.handler = handler;
     self.queue = dispatch_queue_create("com.github.alty.tbl.menubar", DISPATCH_QUEUE_SERIAL);
     if (!CGPreflightScreenCaptureAccess()) {
@@ -32,16 +32,16 @@ static const NSTimeInterval kPollInterval = 0.6;
 
 - (void)poll {
     @autoreleasepool {
-        NSString *text = [self captureAndOCR];
+        NSArray<NSString *> *cands = [self captureAndOCR];
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (self.handler) self.handler(text);
+            if (self.handler) self.handler(cands);
         });
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kPollInterval * NSEC_PER_SEC)),
                    self.queue, ^{ [self poll]; });
 }
 
-- (nullable NSString *)captureAndOCR {
+- (nullable NSArray<NSString *> *)captureAndOCR {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     CGFloat barW = NSScreen.mainScreen.frame.size.width ?: 1440;
@@ -51,16 +51,14 @@ static const NSTimeInterval kPollInterval = 0.6;
 #pragma clang diagnostic pop
     if (!img) return nil;
 
-    __block NSString *best = nil;
+    NSMutableArray<NSString *> *cands = [NSMutableArray array];
     VNRecognizeTextRequest *req = [[VNRecognizeTextRequest alloc]
         initWithCompletionHandler:^(VNRequest *request, NSError *e2) {
         (void)e2;
-        CGFloat bestW = 0;
         for (VNRecognizedTextObservation *obs in request.results) {
             VNRecognizedText *t = [obs topCandidates:1].firstObject;
             if (!t || t.confidence < 0.3 || t.string.length < 2) continue;
-            // 取最长候选:歌词通常比菜单项/时钟长;交给上层做 LRC 匹配过滤
-            if (t.string.length > bestW) { bestW = t.string.length; best = t.string; }
+            [cands addObject:t.string];
         }
     }];
     req.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
@@ -69,7 +67,7 @@ static const NSTimeInterval kPollInterval = 0.6;
     VNImageRequestHandler *rh = [[VNImageRequestHandler alloc] initWithCGImage:img options:@{}];
     [rh performRequests:@[req] error:NULL];
     CFRelease(img);
-    return best;
+    return cands.count ? cands : nil;
 }
 
 @end
