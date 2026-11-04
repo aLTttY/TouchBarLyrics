@@ -9,8 +9,8 @@ OUT="$APP/Contents/MacOS"
 PLIST="$APP/Contents/Info.plist"
 
 clang -fobjc-arc -O2 -Wall -mmacosx-version-min=13.0 \
-    -framework AppKit -framework CoreGraphics -framework QuartzCore \
-    src/main.m src/TBPrivate.m src/TBMediaRemote.m src/TBLyrics.m src/TBTouchBarController.m \
+    -framework AppKit -framework CoreGraphics -framework QuartzCore -framework Vision \
+    src/main.m src/TBPrivate.m src/TBMediaRemote.m src/TBLyrics.m src/TBMenuBarLyric.m src/TBTouchBarController.m \
     -o /tmp/TouchBarLyrics.bin
 
 rm -rf "$APP"

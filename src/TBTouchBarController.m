@@ -2,6 +2,7 @@
 #import "TBPrivate.h"
 #import "TBMediaRemote.h"
 #import "TBLyrics.h"
+#import "TBMenuBarLyric.h"
 #import <AppKit/AppKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <CoreGraphics/CGEvent.h>
@@ -93,6 +94,9 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, assign) BOOL hasSnapshot;
 @property (nonatomic, assign) double lastPos;
 @property (nonatomic, assign) BOOL snapDirty, everPlaying;
+// 菜单栏歌词同步(地面真值)
+@property (nonatomic, assign) NSInteger hintIdx;
+@property (nonatomic, assign) NSInteger hintNoMatch;
 // 歌词
 @property (nonatomic, copy, nullable) NSArray<TBLyricLine *> *lines;
 @property (nonatomic, assign) NSInteger currentLine;
@@ -131,6 +135,10 @@ NS_ASSUME_NONNULL_BEGIN
     (void)observers;   // token 仅用于延长生命周期
     [TBMediaRemote.shared startWithHandler:^(NSDictionary *_Nullable info) {
         [self onNowPlaying:info];
+    }];
+    // 菜单栏歌词 = 网易云自己算的进度,是最佳同步基准
+    [[TBMenuBarLyric shared] startWithHandler:^(NSString *_Nullable text) {
+        [self applyLyricHint:text];
     }];
 }
 
@@ -232,6 +240,8 @@ static void postMediaKey(int key) {
         self.lines = nil;
         self.lyricsLoaded = NO;
         self.currentLine = -1;
+        self.hintIdx = NSNotFound;
+        self.hintNoMatch = 0;
     }
     // 记录最新快照。切歌过渡期可能短暂出现新歌名 + 旧进度(网易云分两步
     // 更新字典),下一次重发布即自行修正,无需特判。
@@ -326,6 +336,75 @@ static void postMediaKey(int key) {
     // 同文本不刷,减少 Touch Bar 重绘(去重逻辑在 container 内部)
     [self.lyricsView performSelectorOnMainThread:@selector(setLyricsText:)
                                       withObject:s waitUntilDone:NO];
+}
+
+#pragma mark - 菜单栏歌词同步(地面真值)
+
+static NSString *TBNormalize(NSString *s) {
+    // 只保留字母数字与 CJK,小写化,抵消 OCR 空格/标点噪声
+    NSCharacterSet *keep = [NSCharacterSet characterSetWithCharactersInString:
+        @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"];
+    NSMutableString *out = [NSMutableString string];
+    for (NSUInteger i = 0; i < s.length; i++) {
+        unichar c = [s characterAtIndex:i];
+        NSString *ch = [NSString stringWithCharacters:&c length:1];
+        if (c >= 0x4e00 && c <= 0x9fff) [out appendString:ch];
+        else if ([keep characterIsMember:c]) [out appendString:[ch lowercaseString]];
+    }
+    return out;
+}
+static BOOL TBFuzzyMatch(NSString *a, NSString *b) {
+    NSString *na = TBNormalize(a), *nb = TBNormalize(b);
+    if (na.length < 2 || nb.length < 2) return NO;
+    if ([na containsString:nb] || [nb containsString:na]) return YES;
+    // 字符重合率(以短串为分母),容忍 OCR 错字
+    NSString *shorter = na.length <= nb.length ? na : nb;
+    NSString *longer  = na.length <= nb.length ? nb : na;
+    NSMutableCharacterSet *cs = [NSMutableCharacterSet characterSetWithCharactersInString:shorter];
+    NSInteger hit = 0;
+    for (NSUInteger i = 0; i < longer.length; i++)
+        if ([cs characterIsMember:[longer characterAtIndex:i]]) { hit++; [cs removeCharactersInString:[NSString stringWithFormat:@"%C", [longer characterAtIndex:i]]]; }
+    return (double)hit / (double)shorter.length >= 0.6;
+}
+
+/// 用菜单栏歌词校准播放位置。OCR 文本 → LRC 行匹配 → 锚定该行时间。
+/// 完全匹配不上时(网易云用了不同版本歌词),直接显示 OCR 文本兜底。
+- (void)applyLyricHint:(NSString *)hint {
+    if (!self.playing) return;
+    if (!self.lines) {
+        // 没抓到我们自己的歌词:直接显示网易云正在唱的这句(仍是同步的)
+        if (hint.length >= 2) [self render:[NSString stringWithFormat:@"  %@  ", hint]];
+        return;
+    }
+    if (!hint.length) return;
+    double pos = [self displayElapsed];
+    NSInteger bestIdx = NSNotFound;
+    double bestDist = 1e9;
+    for (NSInteger i = 0; i < (NSInteger)self.lines.count; i++) {
+        NSString *t = self.lines[i].text;
+        if (t.length < 2 || [t isEqualToString:@"♪"]) continue;
+        if (!TBFuzzyMatch(hint, t)) continue;
+        double d = fabs(self.lines[i].time - pos);
+        if (d < bestDist) { bestDist = d; bestIdx = i; }
+    }
+    if (bestIdx == NSNotFound) {
+        // 连续多次匹配不上:显示 OCR 文本兜底(网易云歌词版本与我们的不同)
+        if (++self.hintNoMatch >= 6 && self.hintIdx == NSNotFound) {
+            [self render:[NSString stringWithFormat:@"  %@  ", hint]];
+        }
+        return;
+    }
+    self.hintNoMatch = 0;
+    if (bestIdx != self.hintIdx) {
+        self.hintIdx = bestIdx;
+        self.currentLine = bestIdx;
+        // 锚定到该行起始时刻,此后按快照公式推进
+        self.snapElapsed = self.lines[bestIdx].time;
+        self.snapTS = [[NSDate date] timeIntervalSince1970];
+        self.snapRate = self.snapRate > 0 ? self.snapRate : 1.0;
+        self.snapDirty = YES;
+        [self refreshLine];
+    }
 }
 
 @end
