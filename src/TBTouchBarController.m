@@ -2,7 +2,6 @@
 #import "TBPrivate.h"
 #import "TBMediaRemote.h"
 #import "TBLyrics.h"
-#import "TBMenuBarLyric.h"
 #import <AppKit/AppKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <CoreGraphics/CGEvent.h>
@@ -94,11 +93,6 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, assign) BOOL hasSnapshot;
 @property (nonatomic, assign) double lastPos;
 @property (nonatomic, assign) BOOL snapDirty, everPlaying;
-// 菜单栏歌词同步(地面真值)
-@property (nonatomic, assign) NSInteger hintIdx;
-@property (nonatomic, assign) NSInteger hintNoMatch;
-@property (nonatomic, assign) NSInteger pendingHintIdx;
-@property (nonatomic, assign) CFAbsoluteTime lastAnchorWall;
 // 歌词
 @property (nonatomic, copy, nullable) NSArray<TBLyricLine *> *lines;
 @property (nonatomic, assign) NSInteger currentLine;
@@ -137,10 +131,6 @@ NS_ASSUME_NONNULL_BEGIN
     (void)observers;   // token 仅用于延长生命周期
     [TBMediaRemote.shared startWithHandler:^(NSDictionary *_Nullable info) {
         [self onNowPlaying:info];
-    }];
-    // 菜单栏歌词 = 网易云自己算的进度,是最佳同步基准
-    [[TBMenuBarLyric shared] startWithHandler:^(NSArray<NSString *> *_Nullable candidates) {
-        [self applyLyricHint:candidates];
     }];
 }
 
@@ -242,9 +232,6 @@ static void postMediaKey(int key) {
         self.lines = nil;
         self.lyricsLoaded = NO;
         self.currentLine = -1;
-        self.hintIdx = NSNotFound;
-        self.pendingHintIdx = NSNotFound;
-        self.hintNoMatch = 0;
     }
     // 记录最新快照。切歌过渡期可能短暂出现新歌名 + 旧进度(网易云分两步
     // 更新字典),下一次重发布即自行修正,无需特判。
@@ -341,102 +328,6 @@ static void postMediaKey(int key) {
                                       withObject:s waitUntilDone:NO];
 }
 
-#pragma mark - 菜单栏歌词同步(地面真值)
-
-static NSString *TBNormalize(NSString *s) {
-    // 只保留字母数字与 CJK,小写化,抵消 OCR 空格/标点噪声
-    NSCharacterSet *keep = [NSCharacterSet characterSetWithCharactersInString:
-        @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"];
-    NSMutableString *out = [NSMutableString string];
-    for (NSUInteger i = 0; i < s.length; i++) {
-        unichar c = [s characterAtIndex:i];
-        NSString *ch = [NSString stringWithCharacters:&c length:1];
-        if (c >= 0x4e00 && c <= 0x9fff) [out appendString:ch];
-        else if ([keep characterIsMember:c]) [out appendString:[ch lowercaseString]];
-    }
-    return out;
-}
-static BOOL TBFuzzyMatch(NSString *a, NSString *b) {
-    NSString *na = TBNormalize(a), *nb = TBNormalize(b);
-    if (na.length < 2 || nb.length < 2) return NO;
-    if ([na containsString:nb] || [nb containsString:na]) return YES;
-    // 字符重合率(以短串为分母),容忍 OCR 错字
-    NSString *shorter = na.length <= nb.length ? na : nb;
-    NSString *longer  = na.length <= nb.length ? nb : na;
-    NSMutableCharacterSet *cs = [NSMutableCharacterSet characterSetWithCharactersInString:shorter];
-    NSInteger hit = 0;
-    for (NSUInteger i = 0; i < longer.length; i++)
-        if ([cs characterIsMember:[longer characterAtIndex:i]]) { hit++; [cs removeCharactersInString:[NSString stringWithFormat:@"%C", [longer characterAtIndex:i]]]; }
-    return (double)hit / (double)shorter.length >= 0.6;
-}
-
-/// 是否为时钟/日期类菜单栏垃圾(11月4日周三 20:12 之类)
-static BOOL TBJunkText(NSString *s) {
-    static NSRegularExpression *re = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        re = [NSRegularExpression regularExpressionWithPattern:
-            @"\\d{1,2}月\\d{1,2}日|周[一二三四五六日天]|\\d{1,2}:\\d{2}" options:0 error:NULL];
-    });
-    return [re numberOfMatchesInString:s options:0 range:NSMakeRange(0, s.length)] > 0;
-}
-/// 是否"像歌词":含 ≥2 个 CJK 字符,或 ≥4 个连续字母,且不是时钟垃圾
-static BOOL TBLyricLike(NSString *s) {
-    if (TBJunkText(s)) return NO;
-    NSInteger cjk = 0, letters = 0, run = 0, bestRun = 0;
-    for (NSUInteger i = 0; i < s.length; i++) {
-        unichar c = [s characterAtIndex:i];
-        if (c >= 0x4e00 && c <= 0x9fff) { cjk++; run = 0; }
-        else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) { run++; bestRun = MAX(bestRun, run); letters++; }
-        else run = 0;
-    }
-    return (cjk >= 2) || (letters >= 4 && bestRun >= 4);
-}
-
-/// 用菜单栏歌词校准播放位置(LRC 白名单制):
-/// OCR 候选必须模糊匹配上当前 LRC 的某一行才被采信,其它一律是垃圾不显示。
-/// 同一行需连续两轮命中才切换锚点(单帧误读不产生任何影响 = 不闪)。
-/// 全程匹配不上(网易云歌词版本与我们的不同)则退回快照公式同步。
-- (void)applyLyricHint:(NSArray<NSString *> *)candidates {
-    if (!self.playing || !self.lines) return;
-    double pos = [self displayElapsed];
-    NSInteger bestIdx = NSNotFound;
-    double bestDist = 1e9;
-    for (NSString *c in candidates) {
-        if (!TBLyricLike(c)) continue;
-        for (NSInteger i = 0; i < (NSInteger)self.lines.count; i++) {
-            NSString *t = self.lines[i].text;
-            if (t.length < 2 || [t isEqualToString:@"♪"]) continue;
-            if (!TBFuzzyMatch(c, t)) continue;
-            double d = fabs(self.lines[i].time - pos);
-            if (d < bestDist) { bestDist = d; bestIdx = i; }
-        }
-    }
-    if (bestIdx == NSNotFound) {
-        // 单轮失败不改变任何状态(抗闪烁);长时间全 miss 才软重置
-        if (++self.hintNoMatch >= 20) {
-            self.hintIdx = NSNotFound;
-            self.pendingHintIdx = NSNotFound;
-            self.hintNoMatch = 0;
-        }
-        return;
-    }
-    self.hintNoMatch = 0;
-    if (bestIdx == self.hintIdx) { self.pendingHintIdx = NSNotFound; return; }
-    // 二次确认:上一轮也命中同一行才切换(单帧误读不锚)
-    if (self.pendingHintIdx != bestIdx) { self.pendingHintIdx = bestIdx; return; }
-    self.pendingHintIdx = NSNotFound;
-    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (self.hintIdx != NSNotFound && now - self.lastAnchorWall < 0.5) return;   // 防抖
-    self.hintIdx = bestIdx;
-    self.currentLine = bestIdx;
-    self.snapElapsed = self.lines[bestIdx].time;
-    self.snapTS = [[NSDate date] timeIntervalSince1970];
-    self.snapRate = self.snapRate > 0 ? self.snapRate : 1.0;
-    self.snapDirty = YES;
-    self.lastAnchorWall = now;
-    [self refreshLine];
-}
 
 @end
 
