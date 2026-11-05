@@ -132,6 +132,11 @@ NS_ASSUME_NONNULL_BEGIN
     [TBMediaRemote.shared startWithHandler:^(NSDictionary *_Nullable info) {
         [self onNowPlaying:info];
     }];
+    // 看门狗:system modal 展示可能被系统静默清掉且无法查询,播放中定期
+    // 重展示(幂等)。暂停/收起状态不打扰。
+    [NSTimer scheduledTimerWithTimeInterval:90 repeats:YES block:^(NSTimer *t) {
+        if (self.playing) [self presentLyrics:nil];
+    }];
 }
 
 /// 注册 ♪ 到 Control Strip 并展开歌词条;presence 未生效时最多重试 30 次
@@ -261,9 +266,13 @@ static void postMediaKey(int key) {
         self.snapElapsed = self.lastPos;
         self.snapTS = [[NSDate date] timeIntervalSince1970];
         self.snapDirty = YES;
+        [self presentLyrics:nil];   // 展示可能被锁屏/睡眠清掉,恢复播放时顺手带回
     }
 
-    if (songChanged) [self fetchLyrics];
+    if (songChanged) {
+        [self fetchLyrics];
+        [self presentLyrics:nil];   // 切歌瞬间同样找回展示
+    }
     [self refreshLine];
 }
 
