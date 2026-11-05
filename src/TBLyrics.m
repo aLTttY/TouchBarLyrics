@@ -1,6 +1,12 @@
 #import "TBLyrics.h"
+#import <sqlite3.h>
 
 NS_ASSUME_NONNULL_BEGIN
+
+static NSString *TBLowerNoSpace(NSString *s) {
+    return [[s stringByReplacingOccurrencesOfString:@" " withString:@""]
+        lowercaseString];
+}
 
 @implementation TBLyricLine
 - (instancetype)initWithTime:(double)t text:(NSString *)s {
@@ -23,10 +29,42 @@ NS_ASSUME_NONNULL_BEGIN
     return s;
 }
 
-- (instancetype)init {
-    self = [super init];
-    if (self) { _cache = [[NSCache alloc] init]; _cache.countLimit = 64; }
-    return self;
+/// 从网易云客户端本地数据库读当前歌曲的精确 song id(播放历史最新 30 行里
+/// 找与标题匹配的行)。拿到 id 后按 id 取词,彻底绕过搜索匹配的错版问题。
++ (nullable NSNumber *)historySongIdForTitle:(NSString *)title {
+    NSString *dbPath = [@"/Users/lumingyuan/Library/Application Support/com.netease.163music/Documents/storage/sqlite_storage.sqlite3"
+        stringByExpandingTildeInPath];
+    NSString *copyPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"tbl_nm_history.sqlite3"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    [fm removeItemAtPath:copyPath error:NULL];
+    if (![fm copyItemAtPath:dbPath toPath:copyPath error:NULL]) return nil;
+
+    NSNumber *result = nil;
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(copyPath.fileSystemRepresentation, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+        sqlite3_stmt *stmt = NULL;
+        if (sqlite3_prepare_v2(db, "SELECT jsonStr FROM historyTracks ORDER BY playtime DESC LIMIT 30",
+                               -1, &stmt, NULL) == SQLITE_OK) {
+            NSString *want = TBLowerNoSpace(title);
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                const unsigned char *js = sqlite3_column_text(stmt, 0);
+                if (!js) continue;
+                id json = [NSJSONSerialization JSONObjectWithData:
+                    [NSData dataWithBytes:js length:strlen((const char *)js)] options:0 error:NULL];
+                NSString *name = [json isKindOfClass:[NSDictionary class]] ? json[@"name"] : nil;
+                if (![name isKindOfClass:[NSString class]]) continue;
+                if ([TBLowerNoSpace(name) isEqualToString:want]) {
+                    id sid = json[@"id"];
+                    if ([sid isKindOfClass:[NSNumber class]]) result = sid;
+                    break;
+                }
+            }
+            sqlite3_finalize(stmt);
+        }
+        sqlite3_close(db);
+    }
+    [fm removeItemAtPath:copyPath error:NULL];
+    return result;
 }
 
 /// 依次尝试多个「来源 × 查询词」组合,任一成功即返回;全失败 completion(nil)。
@@ -39,9 +77,40 @@ NS_ASSUME_NONNULL_BEGIN
     NSArray<TBLyricLine *> *hit = [self.cache objectForKey:key];
     if (hit) { dispatch_async(dispatch_get_main_queue(), ^{ completion(hit); }); return; }
 
-    NSString *withArtist = artist.length ? [NSString stringWithFormat:@"%@ %@", title, artist] : title;
-    NSArray<NSString *> *queries = @[withArtist, title, withArtist, title];
-    [self runAttempt:0 queries:queries target:targetSec key:key completion:completion];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        __weak typeof(self) wself = self;
+        // 最优来源:网易云客户端历史库里的精确 song id(用户就在网易云听,
+        // 该 id 与播放内容必然一致),按 id 取词零歧义
+        NSNumber *hid = [TBLyrics historySongIdForTitle:title];
+        if (hid) {
+            [self fetchNetEaseLyric:hid completion:^(NSArray<TBLyricLine *> *_Nullable lines) {
+                if (lines) {
+                    [wself.cache setObject:lines forKey:key];
+                    dispatch_async(dispatch_get_main_queue(), ^{ completion(lines); });
+                    return;
+                }
+                // 该 id 在网易云也没词 → QQ 兜底(换平台碰运气)
+                NSString *withArtist = artist.length
+                    ? [NSString stringWithFormat:@"%@ %@", title, artist] : title;
+                [wself searchQQ:withArtist target:targetSec completion:^(NSString *_Nullable mid) {
+                    if (!mid) {
+                        dispatch_async(dispatch_get_main_queue(), ^{ completion(nil); });
+                        return;
+                    }
+                    [wself fetchQQLyric:mid completion:^(NSArray<TBLyricLine *> *_Nullable qlines) {
+                        if (qlines) [wself.cache setObject:qlines forKey:key];
+                        dispatch_async(dispatch_get_main_queue(), ^{ completion(qlines); });
+                    }];
+                }];
+            }];
+            return;
+        }
+        // 历史库不可用(路径变了/没在网易云听):常规搜索链
+        NSString *withArtist = artist.length
+            ? [NSString stringWithFormat:@"%@ %@", title, artist] : title;
+        NSArray<NSString *> *queries = @[withArtist, title, withArtist, title];
+        [self runAttempt:0 queries:queries target:targetSec key:key completion:completion];
+    });
 }
 
 - (void)runAttempt:(NSInteger)i queries:(NSArray<NSString *> *)queries
@@ -161,7 +230,8 @@ NS_ASSUME_NONNULL_BEGIN
                 anyBestDiff = diff; anyBest = mid;
             }
         }
-        if (!exact || exactDiff > 8) exact = exact && anyBest && anyBestDiff < exactDiff ? anyBest : (exact ?: anyBest);
+        if (exact && anyBest && anyBestDiff < exactDiff) exact = anyBest;
+        if (!exact) exact = anyBest;
         completion(exact);
     }];
 }
