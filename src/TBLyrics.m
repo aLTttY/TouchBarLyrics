@@ -145,12 +145,14 @@ static BOOL TBVersionSuffix(NSString *name) {
 - (void)pollHistoryUpgrade:(NSString *)title artist:(nullable NSString *)artist
                        key:(NSString *)key
                 completion:(TBLyricsCallback)completion {
-    __weak typeof(self) wself = self;
-    static const double delays[] = {15, 20, 35};
+    // 注意:递归块必须 __block 声明,否则块内引用到的是赋值前的未初始化
+    // 指针,第一次重试即段错误(已实测崩溃)
+    __block void (^tryOnce)(void);
     __block NSInteger attempt = 0;
-    void (^tryOnce)(void);
+    __weak typeof(self) wself = self;
+    static const double delays[] = {15, 35, 70};
     tryOnce = ^{
-        if (attempt >= 3) return;
+        if (attempt >= 3 || !wself) return;
         double d = delays[attempt];
         attempt++;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d * NSEC_PER_SEC)),
