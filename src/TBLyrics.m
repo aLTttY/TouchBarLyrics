@@ -8,6 +8,23 @@ static NSString *TBLowerNoSpace(NSString *s) {
         lowercaseString];
 }
 
+static NSString *TBNorm(NSString *s) {
+    return TBLowerNoSpace(s ?: @"");
+}
+
+/// 版本后缀降权:伴奏/和声/DJ/加速/翻唱等常无词或词不同
+static BOOL TBVersionSuffix(NSString *name) {
+    static NSRegularExpression *re = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        re = [NSRegularExpression regularExpressionWithPattern:
+            @"伴奏|和声|DJ|Remix|remix|加速|降速|0\\.9x|1\\.2x|[Ll]ive|现场|[Cc]over|翻唱|纯音乐|Instrumental"
+            options:0 error:NULL];
+    });
+    return [re numberOfMatchesInString:name ?: @""
+                               options:0 range:NSMakeRange(0, (name ?: @"").length)] > 0;
+}
+
 @implementation TBLyricLine
 - (instancetype)initWithTime:(double)t text:(NSString *)s {
     self = [super init];
@@ -29,8 +46,8 @@ static NSString *TBLowerNoSpace(NSString *s) {
     return s;
 }
 
-/// 从网易云客户端本地数据库读当前歌曲的精确 song id(播放历史最新 30 行里
-/// 找与标题匹配的行)。拿到 id 后按 id 取词,彻底绕过搜索匹配的错版问题。
+/// 从网易云客户端本地数据库读当前歌曲的精确 song id。行写入有延迟
+/// (开播后约 30~90s 才入库),故需要轮询重试。
 + (nullable NSNumber *)historySongIdForTitle:(NSString *)title {
     NSString *dbPath = [@"/Users/lumingyuan/Library/Application Support/com.netease.163music/Documents/storage/sqlite_storage.sqlite3"
         stringByExpandingTildeInPath];
@@ -67,9 +84,6 @@ static NSString *TBLowerNoSpace(NSString *s) {
     return result;
 }
 
-/// 依次尝试多个「来源 × 查询词」组合,任一成功即返回;全失败 completion(nil)。
-/// 顺序:网易(歌名+歌手) → 网易(歌名) → QQ(歌名+歌手) → QQ(歌名)。
-/// target 为正在播放的时长(秒),用于多版本候选中挑时长最接近的。
 - (void)lyricsForTitle:(NSString *)title artist:(nullable NSString *)artist
               duration:(double)targetSec
             completion:(TBLyricsCallback)completion {
@@ -79,43 +93,83 @@ static NSString *TBLowerNoSpace(NSString *s) {
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         __weak typeof(self) wself = self;
-        // 最优来源:网易云客户端历史库里的精确 song id(用户就在网易云听,
-        // 该 id 与播放内容必然一致),按 id 取词零歧义
-        NSNumber *hid = [TBLyrics historySongIdForTitle:title];
-        if (hid) {
-            [self fetchNetEaseLyric:hid completion:^(NSArray<TBLyricLine *> *_Nullable lines) {
+        __block BOOL done = NO;
+        void (^finish)(NSArray<TBLyricLine *> *_Nullable lines, BOOL cacheIt) =
+            ^(NSArray<TBLyricLine *> *_Nullable lines, BOOL cacheIt) {
+            if (cacheIt) [wself.cache setObject:lines forKey:key];
+            dispatch_async(dispatch_get_main_queue(), ^{ completion(lines); });
+        };
+        void (^searchChainThenPoll)(void) = ^{
+            [wself runAttempt:0 queries:@[
+                    artist.length ? [NSString stringWithFormat:@"%@ %@", title, artist] : title,
+                    title,
+                    artist.length ? [NSString stringWithFormat:@"%@ %@", title, artist] : title,
+                    title]
+                target:targetSec artist:artist key:key
+                completion:^(NSArray<TBLyricLine *> *_Nullable lines) {
+                if (done) return;
+                done = YES;
+                dispatch_async(dispatch_get_main_queue(), ^{ completion(lines); });
+                // 搜索链出词后,后台轮询历史库:行入库后按精确 id 重取歌词,
+                // 再次回调替换(controller 幂等消费)——纠错可能选错的版本
+                [wself pollHistoryUpgrade:title artist:artist key:key
+                    completion:^(NSArray<TBLyricLine *> *_Nullable better) {
+                    dispatch_async(dispatch_get_main_queue(), ^{ completion(better); });
+                }];
+            }];
+        };
+
+        // 1) 开播瞬间历史库可能尚未写入本行(延迟 30~90s);命中(重放场景)
+        //    则按精确 id 直取,拿词即终结,不跑搜索链
+        NSNumber *hid0 = [TBLyrics historySongIdForTitle:title];
+        if (hid0) {
+            [wself fetchNetEaseLyric:hid0 completion:^(NSArray<TBLyricLine *> *_Nullable lines) {
                 if (lines) {
-                    [wself.cache setObject:lines forKey:key];
-                    dispatch_async(dispatch_get_main_queue(), ^{ completion(lines); });
+                    done = YES;
+                    finish(lines, YES);
                     return;
                 }
-                // 该 id 在网易云也没词 → QQ 兜底(换平台碰运气)
-                NSString *withArtist = artist.length
-                    ? [NSString stringWithFormat:@"%@ %@", title, artist] : title;
-                [wself searchQQ:withArtist target:targetSec completion:^(NSString *_Nullable mid) {
-                    if (!mid) {
-                        dispatch_async(dispatch_get_main_queue(), ^{ completion(nil); });
-                        return;
-                    }
-                    [wself fetchQQLyric:mid completion:^(NSArray<TBLyricLine *> *_Nullable qlines) {
-                        if (qlines) [wself.cache setObject:qlines forKey:key];
-                        dispatch_async(dispatch_get_main_queue(), ^{ completion(qlines); });
-                    }];
-                }];
+                // 精确 id 在网易云也没词 → 搜索链(含 QQ)先出,轮询不再需要:
+                // 历史库 id 相同,轮询取词结果也为空。但 QQ 可能有 → 已含在链中
+                if (!done) searchChainThenPoll();
             }];
             return;
         }
-        // 历史库不可用(路径变了/没在网易云听):常规搜索链
-        NSString *withArtist = artist.length
-            ? [NSString stringWithFormat:@"%@ %@", title, artist] : title;
-        NSArray<NSString *> *queries = @[withArtist, title, withArtist, title];
-        [self runAttempt:0 queries:queries target:targetSec key:key completion:completion];
+        // 2) 未命中:搜索链先出词,随后轮询历史库纠错
+        searchChainThenPoll();
     });
 }
 
+/// 播放开始后历史库行延迟入库:15s/35s/70s 三次轮询,拿到精确 id 后
+/// 重取歌词并再次回调(completion 会被 controller 幂等消费,替换显示)。
+- (void)pollHistoryUpgrade:(NSString *)title artist:(nullable NSString *)artist
+                       key:(NSString *)key
+                completion:(TBLyricsCallback)completion {
+    __weak typeof(self) wself = self;
+    static const double delays[] = {15, 20, 35};
+    __block NSInteger attempt = 0;
+    void (^tryOnce)(void);
+    tryOnce = ^{
+        if (attempt >= 3) return;
+        double d = delays[attempt];
+        attempt++;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d * NSEC_PER_SEC)),
+            dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                NSNumber *hid = [TBLyrics historySongIdForTitle:title];
+                if (!hid) { tryOnce(); return; }
+                [wself fetchNetEaseLyric:hid completion:^(NSArray<TBLyricLine *> *_Nullable lines) {
+                    if (!lines) { tryOnce(); return; }
+                    [wself.cache setObject:lines forKey:key];
+                    dispatch_async(dispatch_get_main_queue(), ^{ completion(lines); });
+                }];
+        });
+    };
+    tryOnce();
+}
+
 - (void)runAttempt:(NSInteger)i queries:(NSArray<NSString *> *)queries
-            target:(double)target key:(NSString *)key
-        completion:(TBLyricsCallback)completion {
+            target:(double)target artist:(nullable NSString *)artist key:(NSString *)key
+        completion:(void (^)(NSArray<TBLyricLine *> *_Nullable lines))completion {
     if (i >= queries.count) {
         dispatch_async(dispatch_get_main_queue(), ^{ completion(nil); });
         return;
@@ -124,7 +178,7 @@ static NSString *TBLowerNoSpace(NSString *s) {
     NSString *query = queries[i];
     __weak typeof(self) wself = self;
     void (^fail)(void) = ^{
-        [wself runAttempt:i + 1 queries:queries target:target key:key completion:completion];
+        [wself runAttempt:i + 1 queries:queries target:target artist:artist key:key completion:completion];
     };
     void (^succeed)(NSArray<TBLyricLine *> *) = ^(NSArray<TBLyricLine *> *lines) {
         [wself.cache setObject:lines forKey:key];
@@ -132,7 +186,8 @@ static NSString *TBLowerNoSpace(NSString *s) {
     };
 
     if (!isQQ) {
-        [self searchNetEase:query target:target completion:^(NSNumber *_Nullable songId) {
+        [self searchNetEase:query target:target artist:artist
+            completion:^(NSNumber *_Nullable songId) {
             if (!songId) return fail();
             [wself fetchNetEaseLyric:songId completion:^(NSArray<TBLyricLine *> *_Nullable lines) {
                 if (!lines) return fail();
@@ -140,7 +195,7 @@ static NSString *TBLowerNoSpace(NSString *s) {
             }];
         }];
     } else {
-        [self searchQQ:query target:target completion:^(NSString *_Nullable mid) {
+        [self searchQQ:query target:target artist:artist completion:^(NSString *_Nullable mid) {
             if (!mid) return fail();
             [wself fetchQQLyric:mid completion:^(NSArray<TBLyricLine *> *_Nullable lines) {
                 if (!lines) return fail();
@@ -150,11 +205,30 @@ static NSString *TBLowerNoSpace(NSString *s) {
     }
 }
 
+#pragma mark - 候选评分(歌手匹配优先,版本后缀降权,时长就近)
+
+/// 候选综合分:越小越好 = 时长差 + 歌手不匹配罚 20 + 版本后缀罚 15
++ (double)scoreCandidateName:(NSString *)name
+                candidateArt:(NSString *)candidateArtists
+                       query:(NSString *)query
+               playingArtist:(NSString *)playingArtist
+                   targetSec:(double)targetSec
+                candidateSec:(double)candSec {
+    double diff = (targetSec > 1 && candSec > 1) ? fabs(candSec - targetSec) : 15;
+    double score = diff;
+    NSString *pa = TBNorm(playingArtist);
+    NSString *ca = TBNorm(candidateArtists);
+    if (pa.length >= 2 && ca.length >= 2 && [ca containsString:pa]) score += 0;
+    else score += 20;
+    if (TBVersionSuffix(name)) score += 15;
+    (void)query;
+    return score;
+}
+
 #pragma mark - 网易云
 
-/// 搜索:精确同名优先;同名或全部候选中挑时长最接近 target 的
-/// (翻唱/伴奏/现场版时长差异明显),避免搜到错误版本。
 - (void)searchNetEase:(NSString *)query target:(double)targetSec
+               artist:(nullable NSString *)artist
            completion:(void (^)(NSNumber *_Nullable songId))completion {
     NSString *urlStr = [NSString stringWithFormat:
         @"https://music.163.com/api/search/get/web?s=%@&type=1&limit=8",
@@ -163,33 +237,24 @@ static NSString *TBLowerNoSpace(NSString *s) {
     [self getJSON:urlStr referer:@"https://music.163.com/" completion:^(id _Nullable json) {
         NSArray *songs = json[@"result"][@"songs"];
         if (![songs isKindOfClass:[NSArray class]]) { completion(nil); return; }
-        NSNumber *exact = nil, *exactDur = nil, *anyBest = nil;
-        double anyBestDiff = 1e9;
+        NSString *bestId = nil, *bestName = nil;
+        double bestScore = 1e9;
         for (NSDictionary *song in songs) {
             NSString *name = song[@"name"];
-            if (![name isKindOfClass:[NSString class]]) continue;
             id sid = song[@"id"];
-            if (![sid isKindOfClass:[NSNumber class]]) continue;
+            if (![name isKindOfClass:[NSString class]] || ![sid isKindOfClass:[NSNumber class]]) continue;
             id durVal = song[@"duration"];
             double dur = [durVal isKindOfClass:[NSNumber class]]
                 ? [(NSNumber *)durVal doubleValue] / 1000.0 : 0;
-            double diff = (targetSec > 1 && dur > 1) ? fabs(dur - targetSec) : 0;
-            BOOL exactName = [name isEqualToString:query];
-            if (exactName && !exact) { exact = sid; exactDur = @(dur); continue; }
-            if (exactName && targetSec > 1 && dur > 1) {
-                double cur = exactDur ? exactDur.doubleValue : 0;
-                if (diff < fabs(cur - targetSec)) { exact = sid; exactDur = @(dur); }
-            }
-            if (targetSec > 1 && dur > 1 && diff < anyBestDiff) {
-                anyBestDiff = diff; anyBest = sid;
-            }
+            NSMutableString *art = [NSMutableString string];
+            for (NSDictionary *a in [song[@"artists"] isKindOfClass:[NSArray class]]
+                    ? song[@"artists"] : @[])
+                [art appendFormat:@"%@ ", a[@"name"] ?: @""];
+            double score = [TBLyrics scoreCandidateName:name candidateArt:art query:query
+                playingArtist:artist ?: @"" targetSec:targetSec candidateSec:dur];
+            if (score < bestScore) { bestScore = score; bestId = sid; bestName = name; }
         }
-        if (exact && targetSec > 1) {
-            double d = exactDur ? fabs(exactDur.doubleValue - targetSec) : 1e9;
-            if (d > 8 && anyBest && anyBestDiff < d) exact = anyBest;
-        }
-        if (!exact) exact = anyBest;
-        completion(exact);
+        completion(bestId);
     }];
 }
 
@@ -207,6 +272,7 @@ static NSString *TBLowerNoSpace(NSString *s) {
 #pragma mark - QQ 音乐(网易云缺词时的第二来源)
 
 - (void)searchQQ:(NSString *)query target:(double)targetSec
+          artist:(nullable NSString *)artist
       completion:(void (^)(NSString *_Nullable songMid))completion {
     NSString *urlStr = [NSString stringWithFormat:
         @"https://c.y.qq.com/soso/fcgi-bin/client_search_cp?w=%@&format=json",
@@ -215,24 +281,23 @@ static NSString *TBLowerNoSpace(NSString *s) {
     [self getJSON:urlStr referer:@"https://y.qq.com/" completion:^(id _Nullable json) {
         NSArray *songs = json[@"data"][@"song"][@"list"];
         if (![songs isKindOfClass:[NSArray class]]) { completion(nil); return; }
-        NSString *exact = nil, *anyBest = nil;
-        double exactDiff = 1e9, anyBestDiff = 1e9;
+        NSString *bestMid = nil;
+        double bestScore = 1e9;
         for (NSDictionary *song in songs) {
             NSString *mid = song[@"songmid"];
             NSString *name = song[@"songname"];
             if (![mid isKindOfClass:[NSString class]]) continue;
             double dur = [song[@"interval"] isKindOfClass:[NSNumber class]]
                 ? [song[@"interval"] doubleValue] : 0;
-            double diff = (targetSec > 1 && dur > 1) ? fabs(dur - targetSec) : 0;
-            BOOL exactName = [name isKindOfClass:[NSString class]] && [name isEqualToString:query];
-            if (exactName && diff < exactDiff) { exactDiff = diff; exact = mid; }
-            if (targetSec > 1 && dur > 1 && diff < anyBestDiff) {
-                anyBestDiff = diff; anyBest = mid;
-            }
+            NSMutableString *art = [NSMutableString string];
+            for (NSDictionary *a in [song[@"singer"] isKindOfClass:[NSArray class]]
+                    ? song[@"singer"] : @[])
+                [art appendFormat:@"%@ ", a[@"name"] ?: @""];
+            double score = [TBLyrics scoreCandidateName:name candidateArt:art query:query
+                playingArtist:artist ?: @"" targetSec:targetSec candidateSec:dur];
+            if (score < bestScore) { bestScore = score; bestMid = mid; }
         }
-        if (exact && anyBest && anyBestDiff < exactDiff) exact = anyBest;
-        if (!exact) exact = anyBest;
-        completion(exact);
+        completion(bestMid);
     }];
 }
 
