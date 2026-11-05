@@ -2,10 +2,6 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-@interface TBLyrics ()
-@property (nonatomic, strong) NSCache<NSString *, NSArray<TBLyricLine *> *> *cache;
-@end
-
 @implementation TBLyricLine
 - (instancetype)initWithTime:(double)t text:(NSString *)s {
     self = [super init];
@@ -14,54 +10,90 @@ NS_ASSUME_NONNULL_BEGIN
 }
 @end
 
+@interface TBLyrics ()
+@property (nonatomic, strong) NSCache<NSString *, NSArray<TBLyricLine *> *> *cache;
+@end
+
 @implementation TBLyrics
 
 + (instancetype)shared {
     static TBLyrics *s = nil;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ s = [[TBLyrics alloc] init]; });
+    dispatch_once(&once, ^{ s = [[self alloc] init]; });
     return s;
 }
 
 - (instancetype)init {
     self = [super init];
-    if (self) { _cache = [[NSCache alloc] init]; _cache.countLimit = 32; }
+    if (self) { _cache = [[NSCache alloc] init]; _cache.countLimit = 64; }
     return self;
 }
 
+/// 依次尝试多个「来源 × 查询词」组合,任一成功即返回;全失败 completion(nil)。
+/// 顺序:网易(歌名+歌手) → 网易(歌名) → QQ(歌名+歌手) → QQ(歌名)。
+/// target 为正在播放的时长(秒),用于多版本候选中挑时长最接近的。
 - (void)lyricsForTitle:(NSString *)title artist:(nullable NSString *)artist
-              duration:(double)durationSec
+              duration:(double)targetSec
             completion:(TBLyricsCallback)completion {
     NSString *key = [NSString stringWithFormat:@"%@|%@", title, artist ?: @""];
     NSArray<TBLyricLine *> *hit = [self.cache objectForKey:key];
     if (hit) { dispatch_async(dispatch_get_main_queue(), ^{ completion(hit); }); return; }
 
-    NSString *query = artist.length ? [NSString stringWithFormat:@"%@ %@", title, artist] : title;
-    [self search:query targetDuration:durationSec completion:^(NSNumber *_Nullable songId) {
-        // 乐队/歌手名干扰时退化为仅歌名搜索
-        if (!songId) {
-            [self search:title targetDuration:durationSec completion:^(NSNumber *_Nullable fallbackId) {
-                [self fetch:songId ?: fallbackId key:key completion:completion];
-            }];
-            return;
-        }
-        [self fetch:songId key:key completion:completion];
-    }];
+    NSString *withArtist = artist.length ? [NSString stringWithFormat:@"%@ %@", title, artist] : title;
+    NSArray<NSString *> *queries = @[withArtist, title, withArtist, title];
+    [self runAttempt:0 queries:queries target:targetSec key:key completion:completion];
 }
 
-#pragma mark - 网络请求
+- (void)runAttempt:(NSInteger)i queries:(NSArray<NSString *> *)queries
+            target:(double)target key:(NSString *)key
+        completion:(TBLyricsCallback)completion {
+    if (i >= queries.count) {
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(nil); });
+        return;
+    }
+    BOOL isQQ = (i >= 2);
+    NSString *query = queries[i];
+    __weak typeof(self) wself = self;
+    void (^fail)(void) = ^{
+        [wself runAttempt:i + 1 queries:queries target:target key:key completion:completion];
+    };
+    void (^succeed)(NSArray<TBLyricLine *> *) = ^(NSArray<TBLyricLine *> *lines) {
+        [wself.cache setObject:lines forKey:key];
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(lines); });
+    };
 
-- (void)search:(NSString *)query targetDuration:(double)targetSec
-     completion:(void (^)(NSNumber *_Nullable songId))completion {
+    if (!isQQ) {
+        [self searchNetEase:query target:target completion:^(NSNumber *_Nullable songId) {
+            if (!songId) return fail();
+            [wself fetchNetEaseLyric:songId completion:^(NSArray<TBLyricLine *> *_Nullable lines) {
+                if (!lines) return fail();
+                succeed(lines);
+            }];
+        }];
+    } else {
+        [self searchQQ:query target:target completion:^(NSString *_Nullable mid) {
+            if (!mid) return fail();
+            [wself fetchQQLyric:mid completion:^(NSArray<TBLyricLine *> *_Nullable lines) {
+                if (!lines) return fail();
+                succeed(lines);
+            }];
+        }];
+    }
+}
+
+#pragma mark - 网易云
+
+/// 搜索:精确同名优先;同名或全部候选中挑时长最接近 target 的
+/// (翻唱/伴奏/现场版时长差异明显),避免搜到错误版本。
+- (void)searchNetEase:(NSString *)query target:(double)targetSec
+           completion:(void (^)(NSNumber *_Nullable songId))completion {
     NSString *urlStr = [NSString stringWithFormat:
         @"https://music.163.com/api/search/get/web?s=%@&type=1&limit=8",
         [query stringByAddingPercentEncodingWithAllowedCharacters:
             [NSCharacterSet URLQueryAllowedCharacterSet]]];
-    [self getJSON:urlStr completion:^(id _Nullable json) {
+    [self getJSON:urlStr referer:@"https://music.163.com/" completion:^(id _Nullable json) {
         NSArray *songs = json[@"result"][@"songs"];
         if (![songs isKindOfClass:[NSArray class]]) { completion(nil); return; }
-        // 挑选策略:精确同名优先;同名或全部候选中再挑时长最接近的
-        // (翻唱/伴奏/现场版时长差异明显),避免搜到错误版本。
         NSNumber *exact = nil, *exactDur = nil, *anyBest = nil;
         double anyBestDiff = 1e9;
         for (NSDictionary *song in songs) {
@@ -74,16 +106,15 @@ NS_ASSUME_NONNULL_BEGIN
                 ? [(NSNumber *)durVal doubleValue] / 1000.0 : 0;
             double diff = (targetSec > 1 && dur > 1) ? fabs(dur - targetSec) : 0;
             BOOL exactName = [name isEqualToString:query];
-            if (exactName && !exact) { exact = sid; exactDur = @(dur); if (diff == 0) break; continue; }
-            if (exactName && diff < 1e8) {
+            if (exactName && !exact) { exact = sid; exactDur = @(dur); continue; }
+            if (exactName && targetSec > 1 && dur > 1) {
                 double cur = exactDur ? exactDur.doubleValue : 0;
-                if (targetSec > 1 && dur > 1 && diff < fabs(cur - targetSec)) { exact = sid; exactDur = @(dur); }
+                if (diff < fabs(cur - targetSec)) { exact = sid; exactDur = @(dur); }
             }
             if (targetSec > 1 && dur > 1 && diff < anyBestDiff) {
                 anyBestDiff = diff; anyBest = sid;
             }
         }
-        // 精确同名但时长偏差过大(>8s)且存在时长更接近的候选 → 用时长最近者
         if (exact && targetSec > 1) {
             double d = exactDur ? fabs(exactDur.doubleValue - targetSec) : 1e9;
             if (d > 8 && anyBest && anyBestDiff < d) exact = anyBest;
@@ -93,28 +124,70 @@ NS_ASSUME_NONNULL_BEGIN
     }];
 }
 
-- (void)fetch:(NSNumber *_Nullable)songId key:(NSString *)key completion:(TBLyricsCallback)completion {
-    if (!songId) {
-        dispatch_async(dispatch_get_main_queue(), ^{ completion(nil); });
-        return;
-    }
+- (void)fetchNetEaseLyric:(NSNumber *)songId
+               completion:(void (^)(NSArray<TBLyricLine *> *_Nullable lines))completion {
     NSString *urlStr = [NSString stringWithFormat:
         @"https://music.163.com/api/song/lyric?id=%@&lv=1&kv=1&tv=-1", songId];
-    [self getJSON:urlStr completion:^(id _Nullable json) {
+    [self getJSON:urlStr referer:@"https://music.163.com/" completion:^(id _Nullable json) {
         NSString *lrcText = json[@"lrc"][@"lyric"];
-        NSArray<TBLyricLine *> *lines = [lrcText isKindOfClass:[NSString class]]
-            ? [TBLyrics parseLRC:lrcText] : nil;
-        if (lines) [self.cache setObject:lines forKey:key];
-        dispatch_async(dispatch_get_main_queue(), ^{ completion(lines); });
+        completion([lrcText isKindOfClass:[NSString class]]
+            ? [TBLyrics parseLRC:lrcText] : nil);
     }];
 }
 
-- (void)getJSON:(NSString *)urlStr completion:(void (^)(id _Nullable json))completion {
+#pragma mark - QQ 音乐(网易云缺词时的第二来源)
+
+- (void)searchQQ:(NSString *)query target:(double)targetSec
+      completion:(void (^)(NSString *_Nullable songMid))completion {
+    NSString *urlStr = [NSString stringWithFormat:
+        @"https://c.y.qq.com/soso/fcgi-bin/client_search_cp?w=%@&format=json",
+        [query stringByAddingPercentEncodingWithAllowedCharacters:
+            [NSCharacterSet URLQueryAllowedCharacterSet]]];
+    [self getJSON:urlStr referer:@"https://y.qq.com/" completion:^(id _Nullable json) {
+        NSArray *songs = json[@"data"][@"song"][@"list"];
+        if (![songs isKindOfClass:[NSArray class]]) { completion(nil); return; }
+        NSString *exact = nil, *anyBest = nil;
+        double exactDiff = 1e9, anyBestDiff = 1e9;
+        for (NSDictionary *song in songs) {
+            NSString *mid = song[@"songmid"];
+            NSString *name = song[@"songname"];
+            if (![mid isKindOfClass:[NSString class]]) continue;
+            double dur = [song[@"interval"] isKindOfClass:[NSNumber class]]
+                ? [song[@"interval"] doubleValue] : 0;
+            double diff = (targetSec > 1 && dur > 1) ? fabs(dur - targetSec) : 0;
+            BOOL exactName = [name isKindOfClass:[NSString class]] && [name isEqualToString:query];
+            if (exactName && diff < exactDiff) { exactDiff = diff; exact = mid; }
+            if (targetSec > 1 && dur > 1 && diff < anyBestDiff) {
+                anyBestDiff = diff; anyBest = mid;
+            }
+        }
+        if (!exact || exactDiff > 8) exact = exact && anyBest && anyBestDiff < exactDiff ? anyBest : (exact ?: anyBest);
+        completion(exact);
+    }];
+}
+
+- (void)fetchQQLyric:(NSString *)mid
+          completion:(void (^)(NSArray<TBLyricLine *> *_Nullable lines))completion {
+    NSString *urlStr = [NSString stringWithFormat:
+        @"https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg?songmid=%@&g_tk=5381&format=json", mid];
+    [self getJSON:urlStr referer:@"https://y.qq.com/" completion:^(id _Nullable json) {
+        NSString *b64 = json[@"lyric"];
+        if (![b64 isKindOfClass:[NSString class]] || !b64.length) { completion(nil); return; }
+        NSData *data = [[NSData alloc] initWithBase64EncodedString:b64 options:0];
+        NSString *lrcText = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        completion([TBLyrics parseLRC:lrcText ?: @""]);
+    }];
+}
+
+#pragma mark - 通用请求与解析
+
+- (void)getJSON:(NSString *)urlStr referer:(NSString *)referer
+     completion:(void (^)(id _Nullable json))completion {
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlStr]];
-    // 网易云接口要求带浏览器 UA + Referer,否则 403/空结果
+    // 两家接口都要求浏览器 UA + 对应域名 Referer,否则 403/空结果
     [req setValue:@"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15"
         forHTTPHeaderField:@"User-Agent"];
-    [req setValue:@"https://music.163.com/" forHTTPHeaderField:@"Referer"];
+    [req setValue:referer forHTTPHeaderField:@"Referer"];
     req.timeoutInterval = 10;
     [[[NSURLSession sharedSession] dataTaskWithRequest:req
         completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
@@ -125,8 +198,6 @@ NS_ASSUME_NONNULL_BEGIN
             completion(json);
         }] resume];
 }
-
-#pragma mark - LRC 解析
 
 + (nullable NSArray<TBLyricLine *> *)parseLRC:(NSString *)lrc {
     NSMutableArray<TBLyricLine *> *lines = [NSMutableArray array];
