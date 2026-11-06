@@ -94,79 +94,73 @@ static BOOL TBVersionSuffix(NSString *name) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         __weak typeof(self) wself = self;
         __block BOOL done = NO;
-        void (^finish)(NSArray<TBLyricLine *> *_Nullable lines, BOOL cacheIt) =
-            ^(NSArray<TBLyricLine *> *_Nullable lines, BOOL cacheIt) {
-            if (cacheIt) [wself.cache setObject:lines forKey:key];
-            dispatch_async(dispatch_get_main_queue(), ^{ completion(lines); });
-        };
-        void (^searchChainThenPoll)(void) = ^{
-            [wself runAttempt:0 queries:@[
-                    artist.length ? [NSString stringWithFormat:@"%@ %@", title, artist] : title,
-                    title,
-                    artist.length ? [NSString stringWithFormat:@"%@ %@", title, artist] : title,
-                    title]
-                target:targetSec artist:artist key:key
-                completion:^(NSArray<TBLyricLine *> *_Nullable lines) {
-                if (done) return;
-                done = YES;
-                dispatch_async(dispatch_get_main_queue(), ^{ completion(lines); });
-                // 搜索链出词后,后台轮询历史库:行入库后按精确 id 重取歌词,
-                // 再次回调替换(controller 幂等消费)——纠错可能选错的版本
-                [wself pollHistoryUpgrade:title artist:artist key:key
-                    completion:^(NSArray<TBLyricLine *> *_Nullable better) {
-                    dispatch_async(dispatch_get_main_queue(), ^{ completion(better); });
+        // 准确优先:只在拿到"与播放内容一致"的歌词时才显示。
+        // 历史库行延迟 30~90s 入库,每 8s 轮询一次,约 3.5 分钟拿不到
+        // (比如没在网易云听)才退回搜索链。
+        __block NSInteger attempt = 0;
+        __block void (^pollHistory)(void);
+        void (^qqFallback)(NSString *query) = ^(NSString *query) {
+            [wself searchQQ:query target:targetSec artist:artist
+                completion:^(NSString *_Nullable mid) {
+                if (!mid) return;
+                [wself fetchQQLyric:mid completion:^(NSArray<TBLyricLine *> *_Nullable lines) {
+                    if (!lines || done) return;
+                    done = YES;
+                    [wself.cache setObject:lines forKey:key];
+                    dispatch_async(dispatch_get_main_queue(), ^{ completion(lines); });
                 }];
             }];
         };
-
-        // 1) 开播瞬间历史库可能尚未写入本行(延迟 30~90s);命中(重放场景)
-        //    则按精确 id 直取,拿词即终结,不跑搜索链
+        pollHistory = ^{
+            if (done || attempt >= 26) {
+                // 超时(~3.5 分钟):历史库始终没有本行 → 搜索链兜底
+                if (!done) {
+                    done = YES;
+                    NSString *q = artist.length
+                        ? [NSString stringWithFormat:@"%@ %@", title, artist] : title;
+                    [wself runAttempt:0 queries:@[q, title, q, title]
+                        target:targetSec artist:artist key:key
+                        completion:^(NSArray<TBLyricLine *> *_Nullable lines) {
+                        dispatch_async(dispatch_get_main_queue(), ^{ completion(lines); });
+                    }];
+                }
+                return;
+            }
+            attempt++;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)),
+                dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                NSNumber *hid = [TBLyrics historySongIdForTitle:title];
+                if (!hid) { pollHistory(); return; }
+                // 行已入库:精确 id 取词;网易云没词则 QQ 同名兜底
+                [wself fetchNetEaseLyric:hid completion:^(NSArray<TBLyricLine *> *_Nullable lines) {
+                    if (done) return;
+                    if (lines) {
+                        done = YES;
+                        [wself.cache setObject:lines forKey:key];
+                        dispatch_async(dispatch_get_main_queue(), ^{ completion(lines); });
+                        return;
+                    }
+                    qqFallback(artist.length
+                        ? [NSString stringWithFormat:@"%@ %@", title, artist] : title);
+                }];
+            });
+        };
+        // 开播瞬间先查一次(重放的歌历史库已有,秒出)
         NSNumber *hid0 = [TBLyrics historySongIdForTitle:title];
         if (hid0) {
             [wself fetchNetEaseLyric:hid0 completion:^(NSArray<TBLyricLine *> *_Nullable lines) {
                 if (lines) {
                     done = YES;
-                    finish(lines, YES);
-                    return;
-                }
-                // 精确 id 在网易云也没词 → 搜索链(含 QQ)先出,轮询不再需要:
-                // 历史库 id 相同,轮询取词结果也为空。但 QQ 可能有 → 已含在链中
-                if (!done) searchChainThenPoll();
-            }];
-            return;
-        }
-        // 2) 未命中:搜索链先出词,随后轮询历史库纠错
-        searchChainThenPoll();
-    });
-}
-
-/// 播放开始后历史库行延迟入库:15s/35s/70s 三次轮询,拿到精确 id 后
-/// 重取歌词并再次回调(completion 会被 controller 幂等消费,替换显示)。
-- (void)pollHistoryUpgrade:(NSString *)title artist:(nullable NSString *)artist
-                       key:(NSString *)key
-                completion:(TBLyricsCallback)completion {
-    // 注意:递归块必须 __block 声明,否则块内引用到的是赋值前的未初始化
-    // 指针,第一次重试即段错误(已实测崩溃)
-    __block void (^tryOnce)(void);
-    __block NSInteger attempt = 0;
-    __weak typeof(self) wself = self;
-    static const double delays[] = {15, 35, 70};
-    tryOnce = ^{
-        if (attempt >= 3 || !wself) return;
-        double d = delays[attempt];
-        attempt++;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d * NSEC_PER_SEC)),
-            dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                NSNumber *hid = [TBLyrics historySongIdForTitle:title];
-                if (!hid) { tryOnce(); return; }
-                [wself fetchNetEaseLyric:hid completion:^(NSArray<TBLyricLine *> *_Nullable lines) {
-                    if (!lines) { tryOnce(); return; }
                     [wself.cache setObject:lines forKey:key];
                     dispatch_async(dispatch_get_main_queue(), ^{ completion(lines); });
-                }];
-        });
-    };
-    tryOnce();
+                    return;
+                }
+                // 精确 id 也没词:QQ 同名,随后仍轮询(防御)
+                qqFallback(title);
+            }];
+        }
+        pollHistory();
+    });
 }
 
 - (void)runAttempt:(NSInteger)i queries:(NSArray<NSString *> *)queries
